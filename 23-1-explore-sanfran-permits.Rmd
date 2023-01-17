@@ -1,0 +1,436 @@
+---
+title: "23-1-explore-sanfran-permits"
+output:
+  html_notebook:
+    toc : true
+    theme : united
+---
+
+```{r setup 23-1-explore-sanfran-permits, echo=FALSE, include=FALSE}
+source(knitr::purl("13-load-sanfran.Rmd"))
+fs::file_delete("13-load-sanfran.R")
+source(knitr::purl("20-data-exploration.Rmd"))
+fs::file_delete("20-data-exploration.R")
+```
+
+# Data overview
+
+The data spans seven years from Jan 2014 - May 2021. (We can acquire data going back to 2004 if necessary.) This set consists of filed and issued permits. We have ~430K entries, significantly more than what's in the DDRP or Green Halo datasets. Here are the dimensions:
+
+```{r permit dim}
+dim(sanfran_permits)
+```
+
+Here, we get an overview of the columns and associated data types.
+```{r permits structure}
+sanfran_permits %>% 
+  plot_str(type="diagonal")
+```
+
+Let's look at the missing columns for this set. This also gives a better overview of the columns we have:
+
+```{r missing permits}
+sanfran_permits %>% 
+  plot_missing()
+```
+
+This looks really good overall. The only thing missing significantly is the street sfx (which makes sense). The other columns missing some data seem reasonable (revised cost, existing units, expiration date). I can see how we would be missing some of this data. Nothing stands out to me here.
+
+There are still a number of columns that we'll likely ultimately drop (all of the "stories" and "units" columns, number of pages, plansets). I keep these for now. One small note is that the entry status_code is redundant with status. We should drop status_code. Here is the code to show this:
+
+**UPDATE: I've now dropped status_code when loading the data. The referenced chunk is no longer included.**
+
+```{r status duplicate, purl=FALSE, echo=FALSE, include=FALSE}
+if(FALSE){
+sanfran_permits %>% 
+  mutate(status_code = as.character(status_code)) %>% 
+  mutate(status = recode(status, "FILED" = "3", "ISSUED" = "9")) %>% 
+  filter(status!=status_code) %>% 
+  count()
+}
+```
+
+# Repeat permit entries
+
+We wish to identify whether there are repeated entries for each permit number in this dataset. The "permit number" is here called "application number." From comparison with the Green Halo dataset, I verified this is the same thing (see 23-3-explore-sanfran.Rmd). For now, let's check if there are repeat entries. This is the number of unique permit entries:
+
+```{r unique permit num}
+sanfran_permits %>% 
+  select(application_number) %>% 
+  n_distinct()
+```
+
+That's just under half of the total. I believe this is consistent with what was seen in the Austin dataset. Here we count how often each unique permit number is repeated in this dataset:
+
+```{r permit repeats}
+sf_permit_counts <-
+  sanfran_permits %>% 
+  select(application_number) %>%
+  group_by(application_number) %>%
+  mutate(n_repeat = n()) %>%
+  distinct() %>%
+  arrange(-n_repeat)
+
+sf_permit_counts %>% 
+  select(application_number,n_repeat) %>% 
+  head(10)
+```
+
+We can see that some entries are repeated an extraordinary number of times. We'll investigate what's happening with that top one in a minute. But first, let's just see how many permit numbers are repeated with a particular frequency:
+
+```{r repeats hist}
+sf_permit_counts %>% 
+  group_by(n_repeat) %>% 
+  summarise(n_permits_with_frequency = n()) %>% 
+  arrange(n_repeat) %>% 
+  mutate(repeat_frequency = factor(as.character(n_repeat),levels=as.character(n_repeat))) %>%
+  ggplot(aes(x=repeat_frequency,y=n_permits_with_frequency)) +
+  geom_bar(stat='identity', position='dodge') 
+```
+
+This plot indicates that the overwhelming majority permit numbers have two entries.Quite a few also have either a single entry or four entries. There are also many values of repeat_frequency (the number of times a permit is being repeated). Every frequency on the x-axis above has at least one permit associated with it.
+
+The overwhelming reason for the repeat entries is that we have both FILED and ISSUED statuses for the same permit. If we keep only the ISSUED entries, then the picture looks different:
+
+```{r issued-only repeats}
+sanfran_permits %>% 
+  filter(status=="ISSUED") %>% 
+  select(application_number) %>%
+  group_by(application_number) %>%
+  mutate(n_repeat = n()) %>%
+  distinct() %>%
+  group_by(n_repeat) %>% 
+  summarise(n_permits_with_frequency = n()) %>% 
+  arrange(n_repeat) %>% 
+  mutate(repeat_frequency = factor(as.character(n_repeat),levels=as.character(n_repeat))) %>%
+  ggplot(aes(x=repeat_frequency,y=n_permits_with_frequency)) +
+  geom_bar(stat='identity', position='dodge') 
+```
+
+If we look only at issued permits, we see far fewer repeat entries. So, the rough conclusion here would be that **most permits with repeat entries are only differing in their status**. The above plot, however, doesn't prove this. We simply dropped everything that was FILED. We didn't investigate whether a permit that has one ISSUED status and one FILED has different values in any other fields.
+
+To investigate this, we can drop columns status and status_date, then take only the unique entries. (We must drop status_date because this value is updated when the status changes from FILED to ISSUED.) Taking unique entries after dropping these columns means that if the repeat permits only differed due to status/status_date, there will now only be one entry. We do this and then repeat the plot above:
+
+```{r repeats dropped status}
+sanfran_permits %>% 
+  select(!c(status, status_date)) %>% 
+  unique() %>% 
+  select(application_number) %>%
+  group_by(application_number) %>%
+  mutate(n_repeat = n()) %>%
+  distinct() %>%
+  group_by(n_repeat) %>% 
+  summarise(n_permits_with_frequency = n()) %>% 
+  arrange(n_repeat) %>% 
+  mutate(repeat_frequency = factor(as.character(n_repeat),levels=as.character(n_repeat))) %>%
+  ggplot(aes(x=repeat_frequency,y=n_permits_with_frequency)) +
+  geom_bar(stat='identity', position='dodge')
+```
+
+And so, while status/status_date are not the only reason for repeat permits, it is certainly the major reason.
+
+Sometimes there are different addresses for the same permit. Likely this is one permit being filed for a whole lot of buildings being constructed/demolished. We can see this by looking at the entry with 132 repeats.
+
+```{r 132 repeats}
+sanfran_permits %>% 
+  filter(application_number==201602179758) %>% 
+  select(street_number,avs_street_name)
+```
+
+We also have a few rows that are complete duplicates. This can be seen by removing rows that are duplicated across all columns. Here I create a dataframe of only the unique permit entries. It is possible that this occurs because these entries were not unique in one of the columns I dropped (see 13-load-sanfran.Rmd). Regardless, we lose only about 3000 entries.
+
+```{r unique permits}
+sf_permits_unique <-
+  sanfran_permits %>% 
+  unique()
+
+nrow(sf_permits_unique)
+```
+
+I'll use this dataframe moving forward in this notebook. **This step of dropping duplicate entries should likely be added in in the loading pipeline.**
+
+As it turns out, repeat permits do not simply occur because of the above reasons. Repeat permits occur for all possible reasons. For each column, there is at least one permit number that has multiple entries, where the entries differ in said column. 
+
+To show this, below we make a new dataframe. Each row is a unique permit. For each column in the original dataframe, we replace its value with a count of the number of distinct entries per each permit. This number occupies the new dataframe. I do not count NAs when counting the number of  distinct entries. (Note -- running the code chunk is slow, so I wrote the result to a file, which I load here.)
+
+```{r distinct counts}
+fname <- expand_boxpath("San Fran, CA/sf_permits_ndistinct.csv")
+if(FALSE){
+# creates a new df that has unique permit numbers and n_distinct for each col
+sf_permits_unique %>% 
+  group_by(application_number) %>% 
+  mutate(across(form_number:description, ~ n_distinct(., na.rm = TRUE))) %>% 
+  ungroup() %>% 
+  unique() %>% 
+  write_csv(fname)
+}
+
+sf_permits_distinct <- read_csv(fname)
+sf_permits_distinct 
+```
+
+For example, an entry of 2 in a particular column (e.g. status_date, status) indicates this permit was entered twice with two different values for that column. (0 indicates that all entries for this permit in that column were NA.) If we wanted to do so, this dataframe could be useful for determining all the correlated reasons why permits repeat (e.g. when estimated_cost changes, do other columns change?). I do not think that path is worth going down.
+
+To visualize this a little better, below we show, for each column, the number of permits that have multiple entries for that column. Because some columns have way more repeats than others, I added two plots that zoom in on columns with fewer counts (Note -- the colors aren't consistent across each of these plots.)
+
+```{r repeat permit counts}
+# make array for purposes of plotting. Counts number of permits with repeat entries 
+sf_distinct_plotting <- sf_permits_distinct %>% 
+  mutate(across(form_number:description, ~.>1)) %>% 
+  summarise(across(form_number:description, sum)) %>% 
+  pivot_longer(everything(), names_to = "column", values_to = "npermits") %>% 
+  arrange(desc(npermits)) %>% 
+  mutate(column = factor(x=column,levels=column))
+
+# using this same plot three times, so might as well make a function
+custom_bar <- function(df, x, y, fill, xname, yname){
+  df %>% ggplot(aes(x={{x}}, y={{y}}, fill={{fill}})) +
+    geom_bar(stat='identity', position='dodge') + 
+    theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank()) + 
+    scale_x_discrete(name=xname)+
+    scale_y_continuous(name=yname)
+}
+
+xname <- "Column"
+yname <- "Number of permits w/ multiple entries"
+
+# all data
+sf_distinct_plotting %>% 
+  custom_bar(x=column, y=npermits, fill=column, xname=xname, yname=yname)
+
+# zoom once
+sf_distinct_plotting %>% 
+  filter(npermits<50000) %>% 
+  custom_bar(x=column, y=npermits, fill=column, xname=xname, yname=yname)
+
+# zoom twice
+sf_distinct_plotting %>% 
+  filter(npermits<5000) %>% 
+  custom_bar(x=column, y=npermits, fill=column, xname=xname, yname=yname)
+
+```
+
+Given that a permit might have multiple entries because of any field, I cannot think of a way to analyze all the cases of repeat entries. I believe we simply have to make some decisions here.
+
+Going to start with a very simple assumption. Many permits have both a filed and issued status. What seems to happen is that the permit is filed, then gets an updated entry when it is issued. Some fields can change when the permit becomes issued. I'm going to not worry about that and just consider the issued version to be the updated one which we'll use.
+
+Making this assumption cuts out about 200K permits:
+
+```{r keeping updated permits}
+sf_permits_updated <- sf_permits_unique %>% 
+  group_by(application_number) %>% 
+  mutate(issued=status=="ISSUED") %>% 
+  mutate(mean_status=mean(issued)) %>% # values greater than 0 indicate at least one issued status
+  ungroup() %>% 
+  filter(!(mean_status>0 & !issued)) %>%  # if there is an issued and a filed, drop the filed
+  select(!c(mean_status,issued))
+
+sf_permits_updated%>% 
+  nrow()
+```
+
+I think this step should definitely be performed. We still have about 20K repeat entries though. It's my conclusion that we should just make decisions about how to handle each column in 33. It will be easier to do so there because we will cut out some columns.
+
+The following function can be of assistance in such decisions. You pass to it a specific column and it returns the permits in the dataframe that are duplicated due to distinct entries for that column.
+
+```{r repeat permits by}
+repeat_permits_by <- function(df, by){
+  df %>% 
+    group_by(application_number) %>%
+    mutate(count = n_distinct({{by}})) %>%
+    filter(count>1) %>%
+    ungroup() %>%
+    distinct() %>%
+    select(application_number,{{by}},everything(),-count) %>%
+    arrange(application_number)
+}
+```
+
+For example, we can see that (after the above step involving keeping updated permit entries) we have one permit with multiple entries due to form_number.
+
+```{r form number}
+sf_permits_updated %>% 
+  repeat_permits_by(form_number)
+```
+
+My opinion here would be to just use either one (as I think 3 and 8 are both "alterations".)
+
+We have two permits with different values of `estimated_cost`. (The first of these has four total entries because it's also duplicated due to `assessor_stories`.)
+
+```{r estimated cost}
+sf_permits_updated %>% 
+  repeat_permits_by(estimated_cost)
+```
+
+Personally, I would say just take the max cost. A better solution, as suggested by Miguel, is to take the most recent cost. In the above example, this would use the cost associated with the most recent `status_date`. If, for some reason, there isn't a "more recent" cost, then we'd use the max cost.
+
+Overall though, this function could be used to investigate each column, but I'm avoiding doing so in this notebook.
+
+# Permit statuses
+
+We have only two statuses listed here: filed and issued. As I've noted above, a few of the entries seem to be duplicates. We look just at the non-duplicate entries. Here's the overall breakdown:
+
+```{r permit statuses}
+sf_permits_unique %>%
+  select(status) %>%
+  plot_bar()
+```
+
+Here I break the plot down by year (of file date) as requested. Interestingly several of the file dates were before 2014, despite that I obtained these from files labeled 2014-2021. It's not many, relative to the overall number. I cut them off in this plot though.
+
+```{r yearly status}
+sf_permits_unique %>%
+  mutate(year=year(file_date)) %>%
+  group_by(year,status) %>%
+  summarise(counts = n()) %>%
+  filter(year>2013) %>%
+  ggplot(aes(x=year, y=counts, fill=status)) +
+    geom_bar(stat='identity', position='dodge')
+```
+
+There isn't much to say here. I unfortunately don't have much by way of statuses in the permit set. I've noted above that many of the ISSUED entries have FILED duplicates.
+
+# Construction and demolition
+
+I believe the permits I have loaded are both construction and demolition. This can be seen by looking at the form numbers.
+
+```{r form num}
+sf_permits_unique %>%
+  group_by(form_number) %>%
+  count()
+```
+
+The original Green Halo dataset had a column "project_type" with the following possibilities. I recoded them for GH as seen below:
+
+* "3. Full Demolition/Deconstruction (DBI Form No.6)" = "demolition"
+
+* "4. Alteration (DBI Form No.3 or 8)" = "alteration"
+
+* "1. New Construction (DBI Form No.1)" = "construction"
+
+* "2. New Wood Construction (DBI Form No.2)" = "wood_construction"
+
+As you can see, the original names reference DBI form. I am uncertain if "form_number" in the permits data refers to this form, but it seems like a good bet given the above values. Under this assumption, let's make a project_type column for the permits.
+
+```{r proj type}
+sf_permits_unique <- sf_permits_unique %>%
+  mutate(project_type = as.character(form_number)) %>%
+  mutate(project_type = recode(project_type,
+                               "1" = "Form 1 - construction",
+                               "2" = "Form 2 - wood construction",
+                               "3" = "Form 3 - alteration",
+                               "4" = "Form 4 - unknown",
+                               "5" = "Form 5 - unknown",
+                               "6" = "Form 6 - demolition",
+                               "7" = "Form 7 - unknown",
+                               "8" = "Form 8 - alteration"))
+```
+
+I'm keeping these all separate for now, even though 3 and 8 could be combined. Now, let's look at the frequencies of all these different type of projects in the permit data, first overall:
+
+```{r permit proj type}
+sf_permits_unique %>%
+  select(project_type) %>%
+  plot_bar()
+```
+
+The biggest thing happening here is alterations. There's very little construction. We've focused a lot on the C/D ratios, but alterations here are dominating, even given my ignorance of what some of the permit categories are.
+
+In 23-2-explore-sanfran-greenhalo.Rmd, we plot (roughly) the same information for the Green Halo dataset. I'm reproducing it here:
+
+```{r gh proj type}
+sanfran_tonnage %>%
+  select(project_type) %>%
+  plot_bar()
+```
+
+Comparing the permits to GH, the ratios here are clearly different. Is this a selection effect with GH? Does it make sense that more demolition projects would enter into GH?
+
+One thought is that maybe of the repeated permit entries occur for alterations, for some reason. Let's do a quick check on that. Because the major reason for repeated entries is status, I'm filtering out the filed permits here, keeping only the issued ones. I then keep only the unique combos of permit number and project type (I don't want duplicated permits for, say, slightly different addresses). If alterations had many repeated permit entries, this plot should look different:
+
+```{r issued only}
+sf_permits_unique %>%
+  filter(status=="ISSUED") %>%
+  select(application_number,project_type) %>%
+  unique() %>%
+  select(project_type) %>%
+  plot_bar()
+```
+
+But it looks the same. Thus, I don't understand why the permit data looks so different from the Green Halo data. 
+
+We should note that Green Halo only occurs over a brief timespan. So to do the correct comparison, we should filter out all the permits before the earliest Green Halo entry and repeat the above plot. I think the correct comparison is that the status date (permits) needs to be after the approval date (GH):
+
+```{r permits GH timespan}
+earliest_gh_date <- min(sanfran_tonnage$date_approved,na.rm=TRUE)
+
+sf_permits_unique %>%
+  filter(status=="ISSUED") %>%
+  filter(status_date>earliest_gh_date) %>%
+  select(project_type) %>%
+  plot_bar()
+```
+
+The relative frequency of the project types don't look different for the GH timespan. I cannot resolve the discrepancy. Regardless, I more explicitly match the permits between datasets in 23-3-explore-sanfran.Rmd.
+
+# Building type (existing/proposed use)
+
+Unfortunately, in the permit set, I have many categories of what might be called "building type" in the other datasets. By this, I mean commercial, residential, municipal, etc. First, here's the number of categories for proposed_use and existing_use:
+
+```{r building category counts}
+sf_permits_unique %>% 
+  select(proposed_use,existing_use) %>% 
+  summarise(across(everything(), n_distinct))
+```
+
+It's a challenge to condense 97 categories. Here I show counts of the top 15 categories of proposed use, just to give an idea:
+
+```{r proposed building counts}
+sf_permits_unique %>% 
+  group_by(proposed_use) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  head(15) %>% 
+  mutate(proposed_use_top15 = factor(proposed_use,levels=proposed_use)) %>%
+  ggplot(aes(x=proposed_use_top15,y=count, fill=proposed_use_top15)) +
+  geom_bar(stat='identity', position='dodge') + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+```
+
+We can see a lot of residential categories here, as well as a few non-residential. We should also look at the same plot for existing use:
+
+```{r existing building counts}
+sf_permits_unique %>% 
+  group_by(existing_use) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  head(15) %>% 
+  mutate(existing_use_top15 = factor(existing_use,levels=existing_use)) %>%
+  ggplot(aes(x=existing_use_top15,y=count, fill=existing_use_top15)) +
+  geom_bar(stat='identity', position='dodge') + 
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+```
+
+The amounts and order of categories are roughly the same. The notable difference here is "VACANT LOT". Of course it makes sense that this appears in existing use but not proposed use. Note that this causes the colors to be slightly different in the two plots.
+
+Last let's just see how often existing use is the same as proposed use. Here, "same use" indicates existing is the same as proposed, while "different use" indicates that they are either different or one/both is NA.
+
+```{r existing and proposed}
+sanfran_permits %>% 
+  mutate(existing_equals_proposed = (existing_use==proposed_use)) %>% 
+  mutate(existing_equals_proposed = case_when(existing_equals_proposed ~ "same use",
+                                              is.na(existing_equals_proposed) ~ "different use",
+                                              TRUE ~ "different use")) %>% 
+  select(existing_equals_proposed) %>% 
+  group_by(existing_equals_proposed) %>% 
+  summarise(use_change = n()) %>% 
+  ggplot(aes(x="", y = use_change, fill=existing_equals_proposed)) + 
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0)
+```
+
+We can see that the majority of the time, existing use and proposed use are the same. This makes sense in the context of almost everything being an alteration.

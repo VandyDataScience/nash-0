@@ -1,0 +1,546 @@
+---
+title: "41-modeling-forecast"
+output: html_notebook
+---
+
+The purpose of this notebook is to use time series modeling to predict the *number* of permits for each desired subtypes for Nashville. The subtypes can in principle be built of off any number of categorical columns. We have chosen in general to use `comm_v_res` and `project_type`, which take on values of "commercial"/"residential" and "construction"/"demolition", respectively.
+
+```{r Load}
+source(knitr::purl("30-feature-engineering.Rmd", output="tmp-41.R", quiet=TRUE))
+fs::file_delete("tmp-41.R")
+p_load(forecast)
+```
+
+# Main forecast function
+
+```{r forecast permits by subtype}
+forecast_npermits_sub <- function(df, forecast_cols, forecast_yrs = 6, df_start_yr = 2016, df_start_mo = 07, freq = 12, make_plot = FALSE) {
+  #' Forecast npermits by subtype
+  #'
+  #' Create a time-series forecast of the number of permits that will "occur" in the next couple years. The intended use case is to forecast the number of permits that will be issued, though this depends on the user supplying a dataframe of issued-only permits. This can be done by using the function `load_forecast_df`. In principle, forecasts could be constructed for other cities, but at the moment, `load_forecast_df` will only load Nashville permits. The forecasts returned are Gaussian. The returned tibble has several columns of interest: 1. count - forecasted number of permits of specific subtype; 2. sd - standard deviation of Gaussian forecast; 3. half_iqr - half of the inner quartile range; 4. half_i90 - half of the inner 90%. These values are intended for sampling and plotting desired confidence intervals of the forecasts.
+  #'
+  #' @param df (tibble) Tibble containing historical permits (output of `load_forecast_df`).
+  #' @param forecast_cols (chr array) Columns in `df` used to create the subtypes.
+  #' @param forecast_yrs  (num, default=6) Number of years to forecast. Forecast starts at the end of the data in df.
+  #' @param df_start_yr (num, default=2016) First calendar year in `df` to use when building forecast.
+  #' @param df_start_mo (num, default=07) First month in `df` to use when building forecast.
+  #' @param freq (num, default=12) Frequency of forecast. Either 12 (monthly) or 1 (yearly).
+  #' @param make_plot (bool, default=FALSE) If TRUE, show plots of forecast.
+  #'
+  #' @return (tibble) Tibble containing both historical numbers of permits and future forecasted numbers
+  #' @export
+  #'
+  #' @examples
+  #' load_forecast_df() %>% 
+  #'   forecast_npermits_sub(forecast_cols = c("comm_v_res","project_type"), freq = 12, make_plot = TRUE)
+  
+  # set up start list for forecast function
+  start_list <- c(df_start_yr, df_start_mo)
+  start_list <- start_list[!is.na(start_list)]
+  
+  # Create grouping categories based on frequency
+  if(freq==12){
+    group_cats <- c("yrmonth", forecast_cols)
+  }
+  else if(freq==1){
+    group_cats <- c("fy", forecast_cols)
+  }
+  else{
+    stop("Frequency must either be 12 (monthly) or 1 (yearly)")
+  }
+  
+  # grouped df with counts and type category
+  df_counts <- df %>% 
+    group_by(across(all_of(group_cats))) %>% 
+    summarise(count = n()) %>% 
+    ungroup() %>% 
+    unite(type, all_of(forecast_cols), sep=" ")
+  
+  # set up unique values of type; one forecast per type
+  unique_types <- unique(df_counts$type)
+  
+  # map forecast function across types and merge resulting dataframe
+  forecasts <- unique_types %>%
+    map(., ~forecast_by_type(., df_counts, start_list = start_list, yrs=forecast_yrs, freq=freq, make_plot = make_plot)) %>%
+    bind_rows() %>%
+    arrange(date, type) %>%
+    mutate(sd = count-q_16) %>%
+    mutate(half_iqr = count - q_25) %>% 
+    mutate(half_i90 = count - q_05) %>% 
+    select(date, type, count, sd, half_iqr, half_i90) %>%
+    mutate(data = "prediction")
+  
+  # add sd and data 
+  df_counts <- df_counts %>% 
+    mutate(sd = 0, half_iqr = 0, half_i90 = 0, data = "observation")
+  
+  # probably is a more succinct way to do this using lubridate, but oh well
+  if(freq == 12){
+
+    forecasts <- forecasts  %>%
+      mutate(date = as.Date(paste("01",date,sep="-"), format = "%d-%b %Y")) %>%
+      mutate(year = lubridate::year(date), month=lubridate::month(date,label=TRUE)) %>%
+      select(year, month, type, count, sd, half_iqr, half_i90, data)
+
+    df_counts <- df_counts %>%
+      mutate(date = as.Date(str_c(yrmonth, "01"), "%Y%m%d")) %>%
+      mutate(year = lubridate::year(date), month=lubridate::month(date, label=TRUE)) %>% 
+      select(year, month, type, count, sd, half_iqr, half_i90, data)
+  }
+  if(freq == 1){
+    df_counts <- df_counts  %>%
+      mutate(year = as.numeric(fy)) %>%
+      select(year, type, count, sd, half_iqr, half_i90, data)
+    
+    forecasts <- forecasts  %>%
+      mutate(year = as.numeric(date)) %>% 
+      select(year, type, count, sd, half_iqr, half_i90, data)
+  }
+
+  # combine dfs and separate columns
+  results <- df_counts %>%
+    bind_rows(forecasts) %>%
+    separate(type, forecast_cols) %>% 
+    as.tibble()
+  
+  return(results)
+}
+```
+
+# Forecast specific subtype
+
+```{r make forecast for a specific type}
+forecast_by_type <- function(type_val, df, start_list, yrs, freq=12, make_plot=FALSE) {
+  #' Forecast npermits for a given subtype
+  #'
+  #' Forecast the number of permits for a given subtype (e.g. "commercial construction"). This function is not intended to be run by itself, but rather is called within `forecast_npermits_sub`. 
+  #'
+  #' @param type_val (char) String specifying subtype (e.g. "commercial construction")
+  #' @param df (dataframe) Dataframe containing time, subtype, and counts.
+  #' @param start_list (num array) Year, month to start forecast. If yearly forecasts are desired, set month to NA.
+  #' @param yrs (num) Number of years to forecast. Forecast starts at the end of the data in df.
+  #' @param freq (num, default=12) Frequency of forecast. Either 12 (monthly) or 1 (yearly).
+  #' @param make_plot (bool, default=FALSE) If TRUE, show plots of forecast.
+  #'
+  #' @return dataframe containing forecasts for this subtype for desired timeframe.
+  #' @export
+  #'
+  #' @examples See source code of `forecast_npermits_sub`. Not intended as a standalone function.
+  
+  start_list <- start_list[!is.na(start_list)]
+  
+  count <- df %>% 
+    filter(type==type_val) %>% 
+    select(count)
+  
+  # number of forecasts
+  nforecasts <- freq*yrs
+  
+  # forecast
+  type_ts <- ts(count, frequency = freq, start = start_list)
+  auto_var <- auto.arima(type_ts)
+  type_ts_forecast1 <- forecast(auto_var, level = c(50, 68.2, 90, 95), h = nforecasts)
+  
+  # optionally produce forecast plots
+  if(make_plot){
+    plot(type_ts_forecast1, xlab = "year", ylab = type_val)
+  }
+  
+  # turn forecasts into dataframe
+  forecasts <- type_ts_forecast1 %>% 
+    as.data.frame() %>% 
+    rownames_to_column("date") %>% 
+    mutate(type = type_val)
+
+  # Rename forecasts columns
+  colnames(forecasts) <- c("date", "count", "q_25", "q_75", "q_16", "q_84", "q_05", "q_95", "q_2p5", "q_97p5", "type")
+
+  return(forecasts)
+}
+```
+
+# Load function
+
+```{r load dataframe and prep for forecast}
+load_forecast_df <- function(city = "nashville"){
+  #' Load dataframe for npermits forecast
+  #'
+  #' Loads the dataframe containing the historical permits we wish to forecast into the future. A few date manipulations are done to make this work with `forecast_npermits_sub`.
+  #'
+  #' @param city (char, default="nashville") City upon which forecast will be built. Only valid option for now is "nashville"
+  #'
+  #' @return modified dataframe that can be fed into `forecast_npermits_sub`
+  
+  if(city!="nashville"){
+    stop("Only valid city for now is nashville")
+  }
+  
+  load_permits(city="nashville") %>%
+    filter(generates_debris) %>%        # only permits deemed to generate debris
+    filter(comm_v_res!="other") %>%     # I suspect these should be removed
+    mutate(fy = as.numeric(substr(date_issued, 1, 4)) + (substr(date_issued, 6, 7) >= "07")) %>%
+    mutate(yrmonth = format(date_issued, "%Y%m")) %>%
+    filter(yrmonth != "201606" & yrmonth != "202106")
+}
+```
+
+# Test
+
+```{r test funcs, purl=FALSE}
+forecast_cols <- c("comm_v_res", "project_type")
+
+#set to monthly
+load_forecast_df() %>% 
+  forecast_npermits_sub(forecast_cols, freq=12, make_plot=TRUE) %>% 
+  arrange(year,month)
+
+#set to annual
+load_forecast_df() %>% 
+  forecast_npermits_sub(forecast_cols, df_start_yr = 2017, df_start_mo = NA, freq = 1, make_plot=TRUE) %>% 
+  arrange(year)
+```
+
+################################################################################
+Everything below consists of original tests that have been superseded by the above functions. I'm leaving it for now, but it shouldn't be run. The chunks should contain `purl=FALSE` to avoid running when sourcing this file.
+
+```{r nash_time_eda, purl=FALSE}
+
+#takes nash permits and preps for time series
+
+#loads older nash_permits that has yet to be cleaned but does include date_entered
+nash_permits <- read_feather(expand_boxpath("Nashville/nash_permits.feather"))
+
+nash_permits_count = nash_permits %>%
+  filter(permit_subtype_description != "Sign - Ground /  Wall Signs") %>%
+  filter(permit_type_description != "Building Commercial - Change Contractor" & permit_type_description != "Building Residential - Change Contractor") %>%
+  mutate(project_type = if_else(permit_type == "CADM", "demolition", "construction")) %>%
+  mutate(comm_v_res = if_else(str_detect(permit_type_description, "Residential"), "residential", "commercial")) %>%
+  mutate(comm_v_res = if_else(str_detect(permit_subtype_description, "Resid"), "residential", comm_v_res)) %>%
+  #should i filter out the cancelled stuff for forecast? doing so for now
+  filter(status %in% c("DONE","EXPIRED","ISSUED","OK TO PAY","OPEN","PENDING")) %>%
+  #assuming fiscal year starts July 1, below assigns Fy
+  mutate(fy = as.numeric(substr(date_entered, 1, 4)) + (substr(date_entered, 6, 7) >= "07")) %>%
+  #month
+  mutate(yrmonth = format(date_entered, "%Y%m")) %>%
+  mutate(type = paste(comm_v_res, project_type, sep=" "))
+  
+nash_permits_count_fy = nash_permits_count %>%
+  group_by(fy, type) %>%
+  mutate(count = n()) %>%
+  select(fy, type, count) %>%
+  distinct() %>%
+  ungroup() %>%
+  #only have 2 weeks of data from fy 2016, removing
+  filter(fy != 2016)
+  #as a note, missing 2 weeks of data from fy 2020
+
+plot_fy = ggplot(data=nash_permits_count_fy, aes(x=fy, y=count, group=type)) +
+  geom_line(aes(color=type))+
+  geom_point(aes(color=type)) +
+  ggtitle("Permits entered per fiscal year by type")
+
+plot_fy
+
+nash_permits_count_fy
+
+######## now by month
+
+nash_permits_count_mo = nash_permits_count %>%
+  group_by(yrmonth, type) %>%
+  mutate(count = n()) %>%
+  select(yrmonth, type, count) %>%
+  distinct() %>%
+  ungroup() %>%
+  #removing below 2 months because of missing 2 weeks of data in each month
+  filter(yrmonth != "201606" & yrmonth != "202106")
+
+plot_months = ggplot(data=nash_permits_count_mo, aes(x=yrmonth, y=count, group=type)) +
+  geom_line(aes(color=type))+
+  geom_point(aes(color=type)) +
+  ggtitle("Permits entered per month by type") + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, size= 5))
+
+plot_months
+
+######## now by month, minus 6 months for testing
+
+nash_permits_count_mo6 = nash_permits_count_mo %>%
+  filter(yrmonth != "202105" & yrmonth != "202104" & yrmonth != "202103" & yrmonth != "202102" & yrmonth != "202101" & yrmonth != "202012")
+
+plot_months6 = ggplot(data=nash_permits_count_mo6, aes(x=yrmonth, y=count, group=type)) +
+  geom_line(aes(color=type))+
+  geom_point(aes(color=type)) +
+  ggtitle("Permits entered per month by type (minus 6 months)") + 
+  theme(axis.text.x = element_text(angle=90, hjust=1, size= 5))
+
+plot_months6
+
+########
+
+
+```
+
+
+```{r forecast function original, purl=FALSE}
+
+forecast_n_permits <- function(df, forecast_yrs = 5, df_start_yr = 2016, df_start_mo = 07, freq = 12) {
+    
+  months_to_forecast = forecast_yrs * freq
+  start_list = c(df_start_yr, df_start_mo)
+  start_list = start_list[!is.na(start_list)]
+  
+  comm_contr <- df %>% 
+    filter(type== "commercial construction") %>%
+    mutate(row = row_number())
+  
+  res_contr <- df %>% 
+    filter(type== "residential construction") %>%
+    mutate(row = row_number())
+  
+  comm_demo <- df %>% 
+    filter(type== "commercial demolition") %>%
+    mutate(row = row_number())
+  
+  res_demo <- df %>% 
+    filter(type== "residential demolition") %>%
+    mutate(row = row_number())
+
+  forecast_by_subgroup <- function(type) {
+  
+    count = type$count
+    count
+    type_ts = ts(count, frequency = freq, start = start_list)
+    #plot(type_ts)
+    type_ts
+    
+    auto_var = auto.arima(type_ts)
+    
+    #type_ts_forecast1 = as.data.frame(forecast(auto_var))
+    type_ts_forecast1 = forecast(auto_var, level = c(68.2, 95), h = months_to_forecast)
+    return(type_ts_forecast1)
+
+  }
+  
+  plot(forecast_by_subgroup(comm_contr),xlab = "commercial construction forecast")
+  plot(forecast_by_subgroup(res_contr),xlab = "residential construction forecast")
+  plot(forecast_by_subgroup(comm_demo),xlab = "commercial demolition forecast")
+  plot(forecast_by_subgroup(res_demo),xlab = "residential demolition forecast")
+  
+  comm_contr_forecast = as.data.frame(forecast_by_subgroup(comm_contr)) %>%
+    mutate(type="commercial construction") %>%
+    rownames_to_column("date")
+  
+  res_contr_forecast = as.data.frame(forecast_by_subgroup(res_contr)) %>%
+    mutate(type="residential construction") %>%
+    rownames_to_column("date")
+  
+  comm_demo_forecast = as.data.frame(forecast_by_subgroup(comm_demo))%>%
+    mutate(type="commercial demolition") %>%
+    rownames_to_column("date")
+  
+  res_demo_forecast = as.data.frame(forecast_by_subgroup(res_demo))%>%
+    mutate(type="residential demolition") %>%
+    rownames_to_column("date")
+  
+  a = bind_rows(comm_contr_forecast, res_contr_forecast)
+  b = bind_rows(comm_demo_forecast, res_demo_forecast)
+  c = bind_rows(a,b)
+  
+  colnames(c) = c("date", "count","lo68","hi68","lo95","hi95", "type")
+  
+  d = c %>%
+    mutate(sd = count-lo68) %>%
+    select(date, type, count, sd) %>%
+    mutate(data = "prediction")
+  d
+  
+  df1 = df %>%
+    mutate(sd = NA) %>%
+    mutate(data = "observed")
+  df1
+  
+  if(freq == 12){
+    
+    d = d  %>%
+      mutate(date = as.Date(paste("01",date,sep="-"), format = "%d-%b %Y")) %>%
+      mutate(date = format(as.Date(date), "%Y%m"))
+    
+    df1 = df1 %>% 
+      #mutate(date = as.Date(paste("01",yrmonth,sep="-"), format = "%d-%Y%m")) %>%
+      mutate(date = yrmonth) %>%
+      select(date, type, count, sd, data)
+    
+    e = bind_rows(df1,d) %>%
+      mutate(commercial = type == "commercial construction" | type == "commercial demolition") %>%
+      mutate(construction = type == "residential construction" | type == "residential demolition")
+    return(e)
+  }
+  
+  if(freq == 1){
+    df1 = df1 %>% 
+      mutate(date = as.character(fy)) %>%
+      select(date, type, count, sd, data)
+    
+    e = bind_rows(df1,d) %>%
+      mutate(commercial = type == "commercial construction" | type == "commercial demolition") %>%
+      mutate(construction = type == "residential construction" | type == "residential demolition")
+    
+    return(e)
+  }
+  
+  return(d)
+
+}
+
+
+```
+
+
+
+```{r original_fxn_tests, purl=FALSE}
+
+forecast_mo <- forecast_n_permits(nash_permits_count_mo) 
+#monthly forecast works with default options
+
+forecast_n_permits(nash_permits_count_fy, df_start_yr = 2017, df_start_mo = NA, freq = 1) 
+#options for annual forecasts (all years in fiscal years)
+
+forecast_n_permits(nash_permits_count_mo6, forecast_yrs = 0.5) 
+#options for annual forecasts (all years in fiscal years)
+
+```
+
+
+
+```{r check_v_6mo, purl = FALSE}
+
+nash_permits_count_mo_select = nash_permits_count_mo %>%
+  filter(yrmonth == "202105" | yrmonth == "202104" | yrmonth == "202103" | yrmonth == "202102" | yrmonth == "202101" | yrmonth == "202012") %>%
+  mutate(data = "observed")
+  
+nash_permits_count_mo_select
+
+predict6 = forecast_n_permits(nash_permits_count_mo6, forecast_yrs = 0.5)
+predict6_form = predict6 %>%
+  mutate(yrmonth = date) %>%
+  filter(data == "prediction") %>%
+  select(yrmonth,type,count, data)
+
+predict6_form
+
+nash_permits_count_forecast <- rbind(nash_permits_count_mo_select, predict6_form) %>%
+  mutate(data_type = paste(type, data, sep=" "))
+nash_permits_count_forecast
+
+plot_all_f = ggplot(data=nash_permits_count_forecast, aes(x=yrmonth, y=count, group=data_type)) +
+  geom_line(aes(color=data_type))+
+  geom_point(aes(color=data_type)) +
+  ggtitle("FY22 Forecast: Permits per FY by type")
+
+plot_all_f
+
+
+```
+
+
+```{r rmse_calc, purl = FALSE}
+
+rmse <- function (y_pred, y_true) 
+{
+  RMSE <- sqrt(mean((y_true - y_pred)^2))
+  return(RMSE)
+}
+#result = rmse(actual, predicted)
+
+nash_permits_count_rmse = left_join(nash_permits_count_mo_select, predict6_form, by=c("yrmonth","type")) %>%
+  mutate(actual = as.numeric(count.x)) %>%
+  mutate(predicted = as.numeric(count.y)) %>%
+  select(-data.x,-data.y) %>%
+  group_by(type) %>%
+  summarise(
+    RMSE = rmse(actual, predicted),
+    R2 = cor(actual, predicted)^2
+  )
+  
+nash_permits_count_rmse
+
+#RMSE 23.9
+```
+
+
+```{r linear_reg, eval = FALSE, purl = FALSE}
+
+####
+
+#MODELING COMMERCIAL CONSTRUCTION
+
+####
+
+p_load(tidymodels)
+
+comm_contr <- nash_permits_count_mo %>% 
+  filter(type== "commercial construction") %>%
+  mutate(row = row_number())
+
+res_contr <- nash_permits_count_mo %>% 
+  filter(type== "residential construction") %>%
+  mutate(row = row_number())
+
+comm_demo <- nash_permits_count_mo %>% 
+  filter(type== "commercial demolition") %>%
+  mutate(row = row_number())
+
+res_demo <- nash_permits_count_mo %>% 
+  filter(type== "residential demolition") %>%
+  mutate(row = row_number())
+
+
+comm_contr
+
+
+count = comm_contr$count
+
+#training testing set
+
+set.seed(123)
+splits      <- initial_split(comm_contr, strata = count)
+
+comm_other <- training(splits)
+comm_test  <- testing(splits)
+
+#as val set
+
+set.seed(234)
+val_set <- validation_split(comm_other, 
+                            strata = count, 
+                            prop = 0.80)
+val_set
+
+#model
+
+lr_mod <- 
+  linear_reg(mode = "regression", penalty = tune(), mixture = 1) %>% 
+  set_engine("lm")
+
+
+#recipe
+
+lr_recipe <- 
+  recipe(count ~ row, data = comm_contr)
+
+#
+
+lr_wf <- workflow() %>%
+  add_model(lr_mod) %>%
+  add_recipe(lr_recipe) %>%
+  fit(comm_contr)
+
+lr_wf
+
+pred= predict(lr_wf, comm_contr)
+
+plot(pred$.pred)
+
+pred
+
+```

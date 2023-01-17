@@ -1,0 +1,167 @@
+---
+title: "23-3-explore-sanfran-joined"
+output:
+  html_notebook:
+    toc : true
+    theme : united
+---
+
+```{r setup 23-3-explore-sanfran-joined, echo=FALSE, include=FALSE}
+source(knitr::purl("13-load-sanfran.Rmd"))
+fs::file_delete("13-load-sanfran.R")
+source(knitr::purl("20-data-exploration.Rmd"))
+fs::file_delete("20-data-exploration.R")
+```
+
+This notebook is intended to give some idea of what happens when we merge the San Fran permit and green halo datasets. I go over a few of the complications arising when joining the datasets, which mostly has to do with having repeat permit entries (see 23-1). These issues will need to be resolved before we can proceed with modeling. For now, I do not investigate any relationships between variables. That will come soon.
+
+# Green Halo permits in permit data
+
+I want to see if the permits in Green Halo are present in the permit dataset. I'm going to attempt to match by permit number. If this doesn't work, we can explore address matching. First I need to clean up the Green Halo data a bit. 
+
+As discussed in 23-2, some of the permits are odd entries. There are several filters that could be applied to identify them. I've noticed that "good" permits usually begin with "20" and are a particular length. I apply those conditions below. This encompasses all of the odd entries.
+
+```{r odd permits}
+permit_length <- nchar("202008242510")
+
+sanfran_tonnage %>% 
+  filter( !startsWith(permit_number,"20") | nchar(permit_number)!=permit_length) %>% 
+  select(permit_number, total)
+```
+
+We can see here all the possible reasons a permit number could be misentered. We also note that some of these do produce waste. For now, let's split these into two separate dataframes, based on whether or not the permit entry is "good."For the good ones, we do a numeric conversion of the permit number. At the end, we print the number of rows in each df. (**Self note -- There is likely a better way to split a df into two df's based on a condition.**)
+
+```{r good and bad permit numbers}
+sf_tonnage_good_permits <- sanfran_tonnage %>% 
+  filter( startsWith(permit_number,"20") & nchar(permit_number)==permit_length) %>% 
+  mutate(permit_number=as.numeric(permit_number))
+
+sf_tonnage_bad_permits <- sanfran_tonnage %>% 
+  filter( !startsWith(permit_number,"20") | nchar(permit_number)!=permit_length)
+
+print(nrow(sf_tonnage_good_permits))
+print(nrow(sf_tonnage_bad_permits))
+```
+
+Let's take a look at how many of the good permit numbers appear in the permits dataset. Here we print the percentage of "good" permits in GH that have matches in the permits set.
+
+```{r percent match of good permits}
+sf_tonnage_good_permits %>% 
+  filter(permit_number%in%sanfran_permits$application_number) %>% 
+  summarise(matched_permits_frac = n()/nrow(sf_tonnage_good_permits))
+```
+
+Good! We have 99% matching permits. Of course, I'm curious about the four that don't match:
+
+```{r missing good permits}
+sf_missing_good_permits <- sf_tonnage_good_permits %>% 
+  filter(!(permit_number%in%sanfran_permits$application_number))
+
+sf_missing_good_permits %>% 
+  select(permit_number,total,contains("date"))
+```
+
+Three of them don't produce debris. Other than that, I don't see anything notable with the dates.
+
+If we wish to pull in any information from the permit dataset, then I'll need to figure out how to match both these and the above "bad" permits. For now, I'm going to explore whether we actually want any of the permit data. Let's just do this using the good permits.
+
+# Joining permits and green halo
+
+Here I join the two tables. I use a left join on the "good" sanfran permits set to bring in extra permit information for only those permits present in Green Halo. I also drop any duplicates in this step. (There were some duplicated entries in the original permits data.)
+
+```{r join green halo and permits}
+sanfran_joined <- sf_tonnage_good_permits %>% 
+  left_join(sanfran_permits, by=c("permit_number"="application_number")) %>% 
+  unique()
+
+sanfran_joined %>% 
+  glimpse
+```
+
+This "blind join" has given us a datframe with a lot of extra columns and a little over double the original number of rows. This isn't surprising as the permits data has repeat entries. As discussed in 23-1, the largest reason for repeats is that one entry occurs when the permit is filed and one when it is issued. 
+
+As a small sanity check, let's just take a look at some of the addresses from the two dataframes:
+
+```{r address spot check}
+sanfran_joined %>% 
+  select(street_number,avs_street_name,avs_street_sfx, address) %>% 
+  head(15)
+```
+
+My visual inspection suggests that these permits are in fact matching up. I don't want to do a strict match for now because there are cases where the addresses differ. This has to do with the repeat permit entries under different addresses in the permits set. This is something we can resolve later.
+
+For illustration I'm going to temporarily only pay attention to the permits that are issued. Additionally, I'm going to drop a few other columns that I expect might not be relevant for modeling. I've noticed duplicate permit entries often occur because of these columns. I'd like to see if I can just end up with a dataframe without duplicate permits.
+
+```{r sf joined clean}
+sf_joined_clean <- sanfran_joined %>% 
+  filter(status.y=="ISSUED") %>% 
+  select(!c(proposed_units, existing_units, plansets, existing_stories:no_of_pages, street_number:avs_street_sfx)) %>% 
+  unique()
+
+dim(sf_joined_clean)
+```
+
+Compared to our original "good" dataframe (sf_tonnage_good_permits) which had 413 rows, we lose some permits here. We know that four of these were lost because they had no match in the permits set, but that doesn't account for the other 16. Based on my filters, the only option is that they have "FILED" statuses and would have been removed when I kept only issued permits.
+
+Below I make sure the resulting dataframe does not have any repeat permit entries. We simply count the number of unique permits:
+
+```{r frequency of repeats}
+sf_joined_clean %>% 
+  select(permit_number) %>% 
+  n_distinct()
+```
+
+Thus there are no repeat entries.
+
+# EDA on joined data
+
+For now, I will not do much EDA on this merged dataset. I believe before joining, we should really resolve what to do with repeat permit entries. We may need to make the original dataframe wider. 
+
+The larger question is whether it is necessary to do this. Looking at the original columns of the permits dataframe, the only things that I can see being useful that are not already present in some form in Green Halo are revised_cost, estimated_cost, and description. Interestingly, we do in Green Halo have a column project_value. The exact meaning of these three costs needs to be determined.
+
+I would like to do one piece of EDA for now though. In the permits set, we have a form number. In GH, we have a project_type, which has details about the DBI form number. We recoded the GH column as follows:
+
+* "3. Full Demolition/Deconstruction (DBI Form No.6)" = "demolition"
+
+* "4. Alteration (DBI Form No.3 or 8)" = "alteration"
+
+* "1. New Construction (DBI Form No.1)" = "construction"
+
+* "2. New Wood Construction (DBI Form No.2)" = "wood_construction"
+
+We can perform a similar recoding for the form number and compare whether they match up.
+
+```{r project type from permits}
+sf_joined_clean <- sf_joined_clean %>%
+  mutate(project_type_permits = as.character(form_number)) %>%
+  mutate(project_type_permits = recode(project_type_permits,
+                               "1" = "construction",
+                               "2" = "wood_construction",
+                               "3" = "alteration",
+                               "4" = "type 4",
+                               "5" = "type 5",
+                               "6" = "demolition",
+                               "7" = "type 7",
+                               "8" = "alteration"))
+```
+
+Let's first just check on how many match.
+
+```{r gh permits proj type match}
+sf_joined_clean %>% 
+  mutate(proj_type_match = ifelse(project_type==project_type_permits, "same", "different")) %>% 
+  select(proj_type_match) %>% 
+  plot_bar()
+```
+
+Overall, this is really good. There are a few cases where there isn't a match. Let's just look at them directly:
+
+```{r proj type non-match}
+sf_joined_clean %>% 
+  filter(project_type!=project_type_permits) %>% 
+  select(project_type, project_type_permits, description)
+```
+
+The reassuring thing is that none of the unknown DBI form numbers show up here. Why there is an inconsistency though, I truly don't know. If I read the descriptions in these cases, the project type from the permits set actually sounds more correct.
+
+

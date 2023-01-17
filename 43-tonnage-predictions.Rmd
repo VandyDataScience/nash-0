@@ -1,0 +1,375 @@
+---
+title: "43-tonnage-predictions"
+output: html_notebook
+---
+
+In this notebook, we'll model the data using appropriate methods.
+
+```{r Imports}
+# sourced for loading of train/test sets
+source(knitr::purl("30-feature-engineering.Rmd", output="tmp-43.R", quiet=TRUE))
+fs::file_delete("tmp-43.R")
+p_load(tidymodels, h2o, mlflow, kernlab, randomForest, keras)
+```
+
+
+``` {r driver}
+create_model <- function(train, test, model_type, engine, outcome, log_outcome = TRUE, 
+                         model_recipe = NULL, test_hist = TRUE){
+  #' Create a predictive model using tidymodels
+  #'
+  #' Train a predictive model. While this function is fairly general, the intent here is to create a model which predicts debris generated (`total_debris`) on a per-permit basis. The model is to be trained on permits that have associated values of `total_debris`. If `test_hist==TRUE`, the model will be tested against aggregated calendar-year totals of `total_debris` in Nashville.
+  #'
+  #' @param train (tibble) Training set
+  #' @param test (tibble) Test set
+  #' @param model_type (tidymodels model) A selection of models can be found at https://www.tidymodels.org/find/parsnip/
+  #' @param engine (chr) tidymodels engine
+  #' @param outcome (chr) Name of outcome variable (i.e., truth)
+  #' @param log_outcome (bool, default = TRUE) If TRUE, model will be trained/tested using log10(outcome) instead of outcome.
+  #' @param model_recipe (tidymodels recipe, default = NULL) Recipe to use in training the model. If NULL, a default recipe is obtained from `get_default_recipe`
+  #' @param test_hist (bool, default = TRUE) If TRUE, the test set is historical data from Nashville. We will make per-permit predictions for Nashville and compare the results to aggregated calendar year values of `total_debris`. If FALSE, the test set consists of individual permits with values of `total_debris`.
+  #'
+  #' @return (named list) Contents: 1. "model" (output of `fit` from `tidymodels`), 2. "log_outcome", 3. "metrics" (output of `metrics`), 4. "train" (tibble with training observations and predictions), 5. "test" (tibble with testing observations and predictions; NULL if `test` is NULL)
+  #' @export
+  #'
+  #' @examples create_model(train, model_type = linear_reg(), engine = "lm", outcome = "total_debris")
+  
+  # take log10 of outcome if requested; tidymodels does not have a nice way to do this
+  if(log_outcome){
+    train <- train %>% 
+      mutate(across(all_of(outcome), ~log10(.)))
+    if(!is.null(test)){
+      test <- test %>% 
+        mutate(across(all_of(outcome), ~log10(.)))  
+    }
+  }
+  
+  # set up model recipe if not passed
+  if(is.null(model_recipe)){
+    model_recipe <- train %>% 
+      get_default_recipe(outcome)
+  }
+  model <- get_model(model_type, engine)
+  
+  model_workflow <-
+    workflow() %>%
+    add_model(model) %>%
+    add_recipe(model_recipe)
+  
+  model_fit <-
+    model_workflow %>%
+    fit(data = train)
+  
+  tmp_model <- list("model" = model_fit,
+                   "log_outcome" = log_outcome)
+  
+  train_pred <- get_prediction(tmp_model, train)
+
+  # Perform test on historical data if desired
+  if(test_hist){
+    test_pred <- get_prediction(tmp_model, test) %>% 
+      mutate(cy = lubridate::year(date_issued)) %>% 
+      group_by(cy) %>% 
+      summarise(prediction = sum(prediction, na.rm = TRUE)) %>% 
+      filter(cy>2016) %>% 
+      filter(cy<2021) %>% 
+      left_join(load_nash_cy_debris(), by = c("cy" = "cy"))
+  }
+  else{
+    test_pred <- get_prediction(tmp_model, test)
+  }
+  
+  # fix values if prediction ws done in log-space
+  if(log_outcome){
+    train_pred <- train_pred %>%
+      mutate(across(c({{outcome}}), ~ 10^(.)))
+  }
+  
+  # Metrics are computed on unlogged values even if predictions are on logged 
+  # values. This is so the metric has a standard meaning across all models.
+  train_metrics <- metrics(train_pred, truth = !!outcome, estimate = prediction)
+  test_metrics <- metrics(test_pred, truth = !!outcome, estimate = prediction) 
+  
+  if(test_hist){
+  test_metrics <- test_metrics %>% 
+    mutate(.estimate=round(.estimate, digits = 3))
+  }
+  
+  # do we want to save all of this?
+  return(list("model" = model_fit, 
+              "log_outcome" = log_outcome, 
+              "train_metrics" = train_metrics, 
+              "test_metrics" = test_metrics,
+              "train" = train_pred,
+              "test" = test_pred))
+}
+```
+
+
+```{r load cy debris for nashville}
+load_nash_cy_debris <- function(){
+  #' Load Nashville calendar-year values of total debris
+  #'
+  #' The decided-upon way to test the debris-prediction model is to make predictions on historical permits in Nashville and compare the aggregated calendar-year results to known values. This function loads those known values.
+  #'
+  #' @return (tibble) Contains calendar year and total debris for a few years in Nashville
+
+  read_excel(expand_boxpath("Nashville/Recycling and Landfilling totals _ Nashville.xlsx"), sheet = 1, skip = 1) %>%
+    clean_names() %>%
+    filter(!is.na(.)) %>%
+    rename(total_debris = total_debris_generated) %>%
+    arrange(cy) %>%
+    select(cy, total_debris)
+}
+```
+
+
+``` {r model}
+get_model <- function(model_type, engine){
+  #' Get tidymodels model
+  #'
+  #' Puts together the model and engine type specified by the user
+  #'
+  #' @param model_type (tidymodels model) A selection of models can be found at https://www.tidymodels.org/find/parsnip/
+  #' @param engine (chr) tidymodels engine
+  #'
+  #' @return tidymodels model with engine specified
+  #' @export
+  #'
+  #' @examples get_model(linear_reg(), "lm")
+  
+  model_type %>%
+    set_engine(engine)
+}
+```
+
+
+``` {r split}
+split_train_test <- function(df, seed = NULL, frac_train = 0.7){
+  #' Split data into training and testing sets
+  #'
+  #' @param df (tibble) Observations
+  #' @param seed (num, default = NULL) RNG seed
+  #' @param frac_train (num, default = 0.7) Fraction of observations desired in training set
+  #'
+  #' @return (named list) Observations split into training and testing sets
+
+  set.seed(seed)
+  
+  #Need to decide on proportion
+  splits <- initial_split(df, prop = frac_train)
+  
+  train <- training(splits)
+  test <- testing(splits)
+  
+  return(list("train" = train, "test" = test))
+}
+```
+
+
+``` {r base recipe}
+get_base_recipe <- function(outcome, train){
+  #' Get base tidymodels recipe
+  #'
+  #' Set up a base tidymodels recipe establishing outcome variable, formula, and training set. Additional desired steps to the recipe can then be piped after calling this function.
+  #'
+  #' @param outcome (chr) Name of outcome variable (i.e., truth)
+  #' @param train (tibble) Training set
+  #'
+  #' @return tidymodels recipe
+
+  # Set up base recipe
+  formula <-  as.formula(sprintf("%s ~ .", outcome))
+  model_recipe <-
+    recipe(formula, data = train)
+  
+  return(model_recipe)
+}
+```
+
+
+``` {r default recipe}
+get_default_recipe <- function(train, outcome){
+  #' Get default recipe
+  #'
+  #' Set up a default recipe for predicting total_debris for permits. 
+  #'
+  #' @param train (tibble) Training set
+  #' @param outcome (chr) Name of outcome variable
+  #'
+  #' @return tidymodels recipe
+  
+  indicators = c("permit_number", "permit_subtype_description", "council_dist", "date_issued")
+  log_pred = c("const_cost")
+
+  model_recipe <- get_base_recipe(outcome, train) %>% 
+    update_role(all_of(indicators), new_role="ID") %>% 
+    step_impute_median(all_numeric_predictors()) %>% 
+    step_impute_mode(all_nominal_predictors()) %>% 
+    step_log(all_of(log_pred), base = 10, offset=0.01) %>% 
+    step_novel(all_nominal_predictors()) %>% 
+    step_dummy(all_nominal_predictors()) %>% 
+    step_zv(all_predictors())
+  
+  return(model_recipe)
+}
+```
+
+
+``` {r plotting}
+plot_pred_vs_true <- function(predictions, outcome, logspace = TRUE){
+  #' Plot predicted vs true values
+  #'
+  #' @param predictions (tibble) Tibble containing both predictions and true outcome
+  #' @param outcome (chr) Name of outcome variable (i.e., truth)
+  #' @param logspace (bool, default = TRUE) If TRUE, plot x and y in log10-space
+  #'
+  #' @return scatterplot of predictions vs truth
+  
+  p <- predictions %>%
+    ggplot(aes(x = {{outcome}}, y = prediction)) +
+    geom_abline(col = "red", lty = 2) +
+    geom_point(alpha = .4) 
+  
+  if(logspace){
+    p <- p + 
+      scale_x_log10() +
+      scale_y_log10()
+  }
+  
+  return(p)
+}
+```
+
+
+``` {r testing}
+get_prediction <- function(model, df){
+  #' Get prediction
+  #'
+  #' Get predictions using a trained model. If predictions were made in log-space, they will be un-logged.
+  #'
+  #' @param model (named list) Trained model. Output of `create_model`
+  #' @param df (tibble) Features on which we wish to make predictions.
+  #'
+  #' @return (tibble) Original tibble plus predictions
+  
+  # get predictions via model
+  predictions <- predict(model$model, df) %>%
+    bind_cols(df) %>% 
+    rename(prediction = .pred)
+  
+  # un-log if they were computed in log-space
+  if(model$log_outcome){
+    predictions <- predictions %>% 
+      mutate(prediction = 10^prediction)
+  }
+  
+  return(predictions)
+}
+```
+
+
+```{r get features from model}
+get_features <- function(model, dtype = "all"){
+  #' Get features from model
+  #'
+  #' Extract a vector containing all features (not outcome) used in model.
+  #'
+  #' @param model (named list) Model output by `create_model`
+  #' @param dtype (chr, default = "all") Data type of desired features (e.g. "num"). If "all", all features are returned regardless of datatype.
+  #'
+  #' @return (vec) Vector of features used in model.
+
+  var_info <- model$model$pre$actions$recipe$recipe$var_info
+
+  features <- var_info %>%
+    filter(role!="outcome")
+  
+  if(dtype!="all"){
+    features <- features %>% 
+      filter(type==dtype)
+  }
+
+  return(features$variable)
+}
+```
+
+
+```{r set up custom train and test sets}
+train_test_historical <- function(train_city = "all", outcome = "total_debris", min_outcome = 1e-5, max_outcome = 40000, cols_to_keep=NULL){
+  #' Set up custom training and testing sets
+  #'
+  #' Set up historical permits from Nashville as test set, San Fran and/or Austin as training set. For the Nashville permits, we do not have measurements of how much debris is generated for each permit, but we do have aggregated measurements of C&D debris for each calendar year. Thus, we can train on the permits (SF/Aus) which do have debris data, pass in the Nashville permits to make per-permit predictions, aggregate results by calendar year, and compare.
+  #'
+  #' @param train_city (chr, default = "all") Name of city to use for training.
+  #' @param outcome (chr, default = "total_debris") Name of outcome variable. (changing is not recommended)
+  #' @param min_outcome (chr, default = 1e-5) Inclusive minimum value of outcome variable. All observations in the training set with outcome variable less than or equal to this value will be removed.
+  #' @param max_outcome (chr, default = 40000) Inclusive maximum value of outcome variable. All observations in the training set with outcome variable greater than or equal to this value will be removed.
+  #' @param cols_to_keep (chr array, default = NULL) Names of columns to keep in both dataframes. If NULL, all columns are returned.
+  #'
+  #' @return (named list) Named list of tibbles "train","test" with training/testing sets.
+  #' @export
+  #'
+  #' @examples train_test_historical(train_city = "all", 
+  #'                                 outcome = "total_debris",
+  #'                                 max_outcome = 15000, 
+  #'                                 cols_to_keep = c("total_debris", "const_cost", 
+  #'                                                  "project_type", "comm_v_res"))
+  
+  
+  # test <- read_feather(expand_boxpath("Nashville/adams_nashville_no_touching.feather"))
+  test <- load_permits(city="nashville") %>%
+    filter(generates_debris) %>%
+    filter(comm_v_res!="other")
+  
+  # sub-optimal to call this again, but it's fine
+  train <- load_permits(train_city, essentials_only = TRUE) %>% 
+    filter(city_name != "nashville") %>% 
+    select({{outcome}}, everything()) %>% 
+    filter(between(!!rlang::sym(outcome), min_outcome, max_outcome))
+  
+  if(!is.null(cols_to_keep)){
+    if(any(!(cols_to_keep %in% colnames(train)))){
+      stop("passed columns not found in structured dataset")
+    }
+    train <- train %>% 
+      select(all_of(cols_to_keep))
+    test <- test %>% 
+      select(all_of(cols_to_keep))
+  }
+  
+  return(list("train" = train, "test" = test))
+}
+```
+
+
+Here's a function that takes a list of dataframes and returns all columns that have above a certain fraction of non-missing values across all dataframes. 
+
+```{r common low missing cols function}
+common_cols_lowmiss <- function(dflist, thresh = 0.25){
+  #' Common columns with low missing fraction
+  #'
+  #' From a list of dataframes/tibbles, get column names that have less than a particular fraction of missing values in all dataframes.
+  #'
+  #' @param dflist (list) list of dataframes or tibbles
+  #' @param thresh (num, default = 0.25) maximum allowable fraction of missing values
+  #'
+  #' @return (chr array) Names of columns below desired fraction missing in all dataframes
+
+  good_cnames <- NULL
+  for(df_name in dflist){
+    c <- colnames(df_name)
+    mask <- colSums(is.na(df_name))/nrow(df_name) < thresh
+    if(is.null(good_cnames)){
+      good_cnames <- c[mask]
+    }
+    else{
+      good_cnames <- good_cnames[good_cnames %in% c[mask]]
+    }
+  }
+  
+  return(good_cnames)
+}
+```
+
+

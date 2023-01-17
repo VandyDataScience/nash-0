@@ -1,0 +1,208 @@
+---
+title: "13-load-sanfran"
+output: html_notebook
+---
+
+## Load libs, common functions
+```{r}
+source(knitr::purl("10-load-data.Rmd"))
+fs::file_delete("10-load-data.R")
+```
+
+## Green Halo
+
+This contains info on C&D landfill and diverted tonnage. There are material breakdowns as well. Here is a list of some of the things we do when loading this data below:
+
+* We drop all columns that have zero entries. There are 65 columns with no entries. These are all material-level information.
+
+* We require a permit number to exist. There is one row with a missing permit number. It is described as a duplicate entry in the excel file.
+
+* We also perform a recoding of the project type to simplify names with no loss of meaning.
+
+* We previously recoded the building type to reduce the number of entries. Upon further consideration, we should leave it as is for now.
+
+```{r Load SF waste tonnage, purl=FALSE}
+if(FALSE){
+read_excel(expand_boxpath("San Fran, CA/San Francisco Green Halo Data.xlsx")) %>% 
+  clean_names() %>% 
+  rm_na_cols() %>%
+  drop_na(permit_number) %>% 
+  mutate(project_type = recode(project_type,
+                               "3. Full Demolition/Deconstruction (DBI Form No.6)" = "demolition", 
+                               "4. Alteration (DBI Form No.3 or 8)" = "alteration", 
+                               "1. New Construction (DBI Form No.1)" = "construction", 
+                               "2. New Wood Construction (DBI Form No.2)" = "wood_construction")) %>% 
+  mutate(permit_number = str_remove_all(permit_number, "-")) %>% 
+  # mutate(building_type = recode(building_type,
+  #                               "8. Non-Residential/ Commercial" = "commercial",
+  #                               "4. Multifamily (20+ units)" = "multi_family",
+  #                               "5. Mixed Use (w/ 2-4 res. units)" = "mixed",
+  #                               "3. Multifamily (5-19 units)" = "multi_family",
+  #                               "1. Single Family" = "single_family",
+  #                               "7. Mixed Use (w/ 20+ res. units)" = "mixed",
+  #                               "9. Municipal" = "municipal",
+  #                               "2. Multifamily (2-4 units)" = "multi_family",
+  #                               "6. Mixed Use (w/ 5-19 res. units)" = "mixed")) %>% 
+  assert(is.numeric, project_value, square_footage, reuse:wood_clean) %>%
+  assert(is.character, address, project_type, building_type, status) %>%
+  assert(within_bounds(0, Inf), number_of_permits, project_value, square_footage, reuse:wood_clean) %>%
+  assert(is.POSIXct, contains("date")) %>%
+  write_feather(expand_boxpath("San Fran, CA/sanfran_green_halo.feather"))
+}
+```
+
+Remaining issues:
+Permit numbers are inconsistently formatted. We partially resolve this by stripping the dashes, but there are still a few oddities. This may matter if we have to cross-reference permit data.
+Many columns still contain mostly NA's.
+
+## DDRP
+
+The DDRP dataset might not be used. It has a lot of misnamed columns that need explicit fixing. I also rename several below. Additionally, it has one misentered date 1/26/115. This causes a confusing conversion for the column which I fix below.
+
+**NOTE -- The initial decision is to focus on Green Halo data. This dataset is not currently being used. Additional EDA is required to decide its usefulness.**
+
+```{r Load SF DDRP, purl=FALSE}
+if(FALSE){
+read_excel(expand_boxpath("San Fran, CA/San Francisco DDRP and Analysis.xlsx"),
+           sheet=2, skip=2, na=c("", "unknown","n/a")) %>% 
+  clean_names() %>% 
+  rm_na_cols() %>% 
+  rename(application_number = demolition_permit_application_no,
+         ddrp_number = issued_ddrp_number,
+         application_date = permit_application_date,
+         demo_date = date_demo_completed,
+         filing_date = date_of_filing,
+         approval_date = date_of_approval,
+         issue_date = date_of_issue,
+         inspection_date = date_of_final_inspection,
+         wood_reuse = wood_pallets_lumber_17,
+         fixtures_reuse = cabinets_fixtures_doors_windows_equipment_18,
+         metal_reuse = metal_19,
+         concrete_reuse = concrete_20,
+         asphalt_reuse = asphalt_21,
+         stones_reuse = brick_masonry_tile_22,
+         earth_reuse = rock_dirt_soil_23,
+         other_reuse = other_24,
+         wood_recyc = wood_pallets_lumber_25,
+         metal_recyc = metal_26,
+         drywall_recyc = drywall_27,
+         green_recyc = green_waste_28,
+         concrete_recyc = concrete_29,
+         asphalt_recyc = asphalt_30,
+         stones_recyc = brick_masonry_tile_31,
+         earth_recyc = rock_dirt_soil_32,
+         debris_recyc = mixed_debris_33,
+         other_recyc = other_34,
+         wood_facility = wood_pallets_lumber_35,
+         fixtures_facility = cabinets_fixtures_doors_windows_equipment_36,
+         metal_facility = metal_37,
+         carpet_facility = carpet,
+         padding_facility = carpet_padding,
+         ceiling_facility = ceiling_tile,
+         drywall_facility = drywall_41,
+         green_facility = green_waste_42,
+         concrete_facility = concrete_43,
+         asphalt_facility = asphalt_44,
+         stones_facility = brick_masonry_tile_45,
+         earth_facility = rock_dirt_soil_46,
+         debris_facility = mixed_debris_47,
+         wood_landfill = wood_pallets_lumber_48,
+         stone_landfill = brick_masonry_tile_49,
+         debris_landfill = mixed_debris_50,
+         other_landfill = other_51,
+         garbage_landfill = sorted_non_recyclable_non_compostable_debris
+         ) %>% 
+  select(!c(x53,year_built,zoning_district)) %>% 
+  mutate(inspection_date = ifelse(inspection_date == "1/26/115", "42030", inspection_date)) %>%
+  mutate(inspection_date = text_to_POSIXct(inspection_date)) %>% 
+  assert(is.numeric, sq_ft, wood_reuse:garbage_landfill) %>% 
+  assert(is.POSIXct, contains("date")) %>% 
+  write_feather(expand_boxpath("San Fran, CA/sanfran_ddrp.feather"))
+}
+```
+
+## Permits
+
+Below I'm reading the filed/issued permits. We have one file per month from 2014 - May 2021. I experienced issues with inconsistent date formatting (being read as numeric in some files, but not others) and shifted columns in one file. I explicitly fixed the shifted file in excel. Below, I have some commented out code which I use to identify the problematic file (May2020). 
+
+### Reading one file, identifying misformatted files
+Here, I define a custom function to read in an individual permit file. We read in everything as text and perform the necessary conversions. The verify statement will catch things that don't fall within my fairly conservative date range. This helped me identify that May 2020 had shifted columns.
+
+```{r Read one SF permit file}
+read_permit_file <- function(filename){
+  read_excel(filename, col_types="text") %>%
+    clean_names() %>%
+    mutate(across(contains("date"), ~ text_to_POSIXct(.))) %>% 
+    assert(is.POSIXct, contains("date")) %>% 
+    verify(all(c(file_date, expiration_date, status_date) %within% interval(
+      ymd("2000-01-01"), ymd("2050-01-01")), na.rm = TRUE))
+}
+```
+
+In this chunk, I check all of the permit files. I could probably replace this with a tryCatch. Anyway, it broke on the file "San Fran, CA/permits/May2020FiledIssued.xlsx". Once I discovered this I moved that file to another folder "San Fran, CA/permits/misentries". I corrected the error in excel and replaced it with the file "San Fran, CA/permits/correctedMay2020FiledIssued.xlsx". In doing so, I did delete a column that we're throwing out anyway. Now, the code no longer breaks.
+```{r Verify all permit files, purl=FALSE}
+if(FALSE){
+file_list <- dir_ls("~/sanfran/permits_filed_issued", glob="*FiledIssued.xlsx") 
+
+for(fname in file_list){
+  print(fname)
+  df_tmp <- read_permit_file(fname)
+}
+}
+```
+
+### Reading all permit files into one dataframe
+Here is the official reading in with all of the relevant checks. Dates have already been converted in "read_permit_file", which is probably bad practice. I do the other necessary conversions here.
+I make the decision to drop several columns at this point. This is based on obvious irrelevancy and some very basic EDA. Here are my notes on which columns I drop:
+
+* Everything from "unit" through "contact_phone" is very irrelevant. The column "unit" literally indicates the apartment unit (e.g. A, 2A, etc.). This will not be used in any way. The rest of these columns are details about the contractor (name, number, address, etc). We drop all of that. We keep the column "description" which has some potentially useful info about whether this was a remodel or what. 
+
+* The last four columns are "x42", "parcel", "street_number_34", and "x43". These are all >99% missing and contain no useful information. The x42 and x43 columns are unnamed columns that exist in a few excel files. They consist of some incoherent text description for 29 and 2 permits, respectively. The parcel column has 8 entries, and street_number_34 is related to the contractor.
+
+* I also drop x15_day_hold, voluntary_soft_story_retrofit, block, and lot. The first two of these are booleans with very few (<1%) entries. Regardless, I don't see their use. The block and lot columns are related to the address, but aren't necessary as we have the full address already. If we ever deem them useful, we can revisit this. For now, I think the address is sufficient.
+
+* Last, I drop status_code. I realized this was redundant with status. There is some code to show this in 23-explore-sanfran.
+
+After dropping the above columns, I write this file out to the San Fran box folder in the feather format.
+
+```{r Convert permits to feather, purl=FALSE}
+if(FALSE){
+dir_ls(expand_boxpath("San Fran, CA/permits"), glob="*FiledIssued.xlsx") %>%
+  map_df(read_permit_file) %>%
+  rm_na_cols() %>% 
+  select(!c(x15_day_hold, status_code, voluntary_soft_story_retrofit, block, lot, 
+            unit:contact_phone, x42:x43)) %>%
+  rename(street_number = street_number_23) %>% 
+  mutate(application_number = as.numeric(str_replace(application_number, "#", ""))) %>% 
+  mutate(across(c(form_number, estimated_cost, revised_cost, existing_units, 
+                  proposed_units:no_of_pages), ~ as.numeric(.))) %>%
+  assert(is.numeric, application_number, form_number, estimated_cost, revised_cost, 
+         existing_units, proposed_units:no_of_pages) %>%
+  assert(is.POSIXct, contains("date")) %>% 
+  write_feather(expand_boxpath("San Fran, CA/sanfran_permits_2014_2021.feather"))
+}
+```
+
+
+# Load data from feather
+
+Here we read all feather files in here. This is the only chunk of code that should execute. We perform a few asserts which are duplicated from above.
+```{r feather load}
+# read green halo (tonnage) data
+sanfran_tonnage <- read_feather(expand_boxpath("San Fran, CA/sanfran_green_halo.feather")) %>% 
+  assert(is.numeric, project_value, square_footage, reuse:wood_clean) %>%
+  assert(is.character, address, project_type, building_type, status) %>%
+  assert(within_bounds(0, Inf), number_of_permits, project_value, square_footage, reuse:wood_clean) %>%
+  assert(is.POSIXct, contains("date"))
+
+# read ddrp data (can add more asserts if we decide to use this)
+sanfran_ddrp <- read_feather(expand_boxpath("San Fran, CA/sanfran_ddrp.feather")) %>% 
+  assert(is.numeric, sq_ft, wood_reuse:garbage_landfill) %>% 
+  assert(is.POSIXct, contains("date"))
+
+# read sanfran permit data
+sanfran_permits <- read_feather(expand_boxpath("San Fran, CA/sanfran_permits_2014_2021.feather")) %>% 
+  assert(is.numeric, application_number, form_number, estimated_cost, revised_cost, 
+         existing_units, proposed_units:no_of_pages) %>%
+  assert(is.POSIXct, contains("date")) 
+```

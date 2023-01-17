@@ -1,0 +1,12 @@
+The following files and folders are required to be in this folder for the shiny app to run:
+
+* `best_forecast.feather` -- npermits forecast; output of `41`
+
+* `historical_debris_permits_nash.xlsx` -- contains historical calendar-year landfill, recycling, and npermits
+(Note - this file was constucted by hand from several files in the Box drive. It is also located on Box)
+
+* `map_summary.feather` -- a summary used for the maps tab; output of `45`
+
+* `syn_permit_summary.feather` -- a summary used for debris tab; output of `45`
+
+* `shape` -- a folder containing files with council district geo info for use in maps tab

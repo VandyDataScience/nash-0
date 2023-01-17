@@ -1,0 +1,160 @@
+---
+title: "11-load-austin"
+output:
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    number_sections: true
+---
+
+## Load libs, common functions
+```{r Load austin}
+source(knitr::purl("10-load-data.Rmd"))
+fs::file_delete("10-load-data.R")
+pacman::p_load(DataExplorer)
+```
+
+# Issued Construction Permits
+This contains permit information, but no data on debris. It seems to have roughly similar information to the Nashville data set, though the  permit types need a little clearing up.
+
+```{r load raw construction permit}
+cols_to_change = cols("Applicant Full Name" = col_character(), "Applicant Organization" = col_character(), "Applicant Phone" = col_character(), "Applicant Address 1" = col_character(), "Applicant Address 2"= col_character(), "Applicant City" = col_character(), "Applicant Zip" = col_character(), "Total Existing Bldg SQFT" = col_double(), "Total Valuation Remodel" = col_double(), "Building Valuation" = col_double(), "Building Valuation Remodel" = col_double(), "Electrical Valuation" = col_double(), "Mechanical Valuation" = col_double(), "MedGas Valuation" = col_double(), "MedGas Valuation Remodel" = col_double())
+
+austin_permits <- read_csv(expand_boxpath("Austin, TX/Issued_Construction_Permits.csv"), col_types = cols_to_change)
+```
+
+To clean the data, we'll be dropping full NA columns and dropping NA permit numbers.  Let's check right quick to see the effect of this:
+
+```{r check construction NAs, fig.height=8, purl=FALSE}
+plot_missing(austin_permits)
+
+austin_permits %>%
+  filter(is.na(`Permit Num`) | `Permit Num`=='') %>%
+  summarise(total_empty = n())
+```
+Looks like there's only one full NA column (`MedGas Valuation`) and there are no NA or blank permit numbers.
+
+```{r clean and ensure correct data types}
+austin_permits <- austin_permits %>%
+  clean_names() %>% 
+  select(-starts_with('contractor'), -starts_with('applicant')) %>%
+  rm_na_cols() %>%
+  # select(!c(gh_tracking_number)) %>% 
+  drop_na(permit_num) %>% 
+  assert(is.numeric, calendar_year_issued, fiscal_year_issued, latitude, longitude) %>% 
+  assert(is.character, permit_type_desc, permit_class_mapped, permit_class, work_class,  project_name, description, property_legal_description, day_issued, status_current, original_address_1)
+```
+
+# Residential Demolitions Subset
+This data set contains information specifically about residential demolitions. It contains a subset of data from the Issued Construction Permits data set, and most useful columns are present. One notable additional column is the "demolition_category", which is not present in the Issued Construction Permits set. This column contains the distinction between total and partial demolitions.
+
+``` {r Load Residential Demolition}
+res_demo_permits <- read_csv(expand_boxpath("/Austin, TX/Residential_Demolitions_dataset.csv"))
+```
+
+```{r check residential demolition NAs, purl=FALSE}
+plot_missing(res_demo_permits)
+
+res_demo_permits %>%
+  filter((is.na(permit_number)) | (permit_number =='')) %>%
+  summarise(total_empty = n())
+```
+Looks like there are no fully missing columns here and things are looking good.
+
+```{r clean up residential permit}
+res_demo_permits <- res_demo_permits %>%
+  clean_names() %>% 
+  rm_na_cols() %>%
+  drop_na(permit_number) %>% 
+  assert(is.numeric, calendar_year_issued, original_zip) %>% 
+  assert(is.character, permit_type_desc, permit_class_mapped, permit_class, description, work_class, status_current)
+```
+
+
+# Cleaning EDA
+## Construction Permits
+
+For both data sets, this creates a clean version of the permit number, as well as identifies all unique entries from relevant columns.  When we create a clean permit number, this has the side effect of producing non-unique fields in `permit_num_clean`.  This is because the non-numeric values in `permit_num` are specifiers for the permit type.
+
+```{r fix permit numbers}
+austin_permits$permit_num_clean <- str_replace_all(austin_permits$permit_num,"[^0-9]", "") 
+res_demo_permits$permit_num_clean <- str_replace_all(res_demo_permits$permit_number,"[^0-9]", "") 
+```
+
+
+```{r Clean, fig.width=16, fig.height=12, purl=FALSE}
+columns_to_find_unique <- c("permit_type", "permit_type_desc", "permit_class", "work_class", "status_current", "original_zip")
+unique_table <- lapply(austin_permits[columns_to_find_unique], function(x) unique(x))
+unique_table
+
+plot_bar(austin_permits, maxcat=80)
+plot_histogram(austin_permits)
+```
+### Questionable Behavior
+
+The above plots show some points of concern based on the long tails in some of the data.  Specifically:
+
+* `original_city` is interesting.  Do we want to focus on Austin only?
+* `original_state` is curious that it is blank.  Are there any issues with that permit?
+* `calendar_year_issued` is quite interesting.  What filtering do we want to do there?
+* `housing_units` has a very long tail.  The longest part of the tail shows more than 400,000 units.  Typo?
+* `number_of_floors` also has a very long tail.  There are 64 permits with > 1,000 floors and 9 with > 5,000 floors.  One has 354,189 floors.  5 of the permits with > 5,000 floors are mobile home deck additions.  I have questions.
+* `longitude` and `original_zip` have long tails, and it looks like some of the entries are zero.  What should we do with those?
+
+If we don't know what to do with these, it could be that we just add a column for `suspicious`.  
+
+## Residential Demolition Permits
+```{r fig.height=12, fig.width=16, purl=FALSE}
+demo_columns_to_find_unique <- c("permit_type_desc", "demolition_category", "work_class", "status_current", "original_zip")
+demo_unique_table <- lapply(res_demo_permits[demo_columns_to_find_unique], function(x) unique(x))
+demo_unique_table
+
+plot_bar(res_demo_permits, maxcat=80)
+plot_histogram(res_demo_permits)
+```
+
+The information from the residential data seems to be reasonable.  There will a question about how to put these two dataframes together.
+
+
+##Write to Feather
+``` {r Write to Feather}
+
+#Commented this out so I don't accidentally overwrite these files when sourcing this notebook.
+
+# write_feather(austin_permits, expand_boxpath("Austin, Tx/austin_permits.feather"))
+# 
+# write_feather(res_demo_permits, expand_boxpath("Austin, Tx/austin_res_demo_permits.feather"))
+
+```
+
+
+#Load From Feather
+``` {r Load Feather}
+
+austin_permits <- read_feather(expand_boxpath("Austin, Tx/austin_permits.feather"))
+res_demo_permits <- read_feather(expand_boxpath("Austin, Tx/austin_res_demo_permits.feather"))
+
+
+```
+
+
+
+
+
+## Austin Tonnages
+I'm adding this section to handle loading the tonnage data for Austin
+``` {r Load tonange}
+
+austin_tonnages_all <- read_excel(expand_boxpath("Austin, TX/CDAPL - CD Permit List for Sharing.xlsx"), sheet =5)
+
+tonnage_columns <- c("Total Diversion Tons", "Total Landfill Tons", "Total Tons", "Diversion Tons", "Landfill Tons", "Total Tons5", "Project Diversion Rate", "Project Disposal Rate", "Commingled Diversion Tons", "Commingled Landfill Tons", "Commingled Total Tons", "Pounds Per Square Foot", "Value", "Submitted Permit Type" )
+
+austin_tonnages <- austin_tonnages_all %>%
+  select(tonnage_columns)
+
+austin_tonnages$permit_num_clean <- str_replace_all(austin_tonnages$Value,"[^0-9]", "")
+
+write_feather(austin_tonnages, expand_boxpath("Austin, Tx/austin_tonnages.feather"))
+
+```

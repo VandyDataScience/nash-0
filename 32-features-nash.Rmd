@@ -1,0 +1,203 @@
+
+---
+title: "32-features-nash"
+output: html_notebook
+---
+
+The purpose of this notebook is feature engineering - to either use the current features or generate new features based upon them.  The data should also be tested here to ensure that the features generated meet expectations and assumptions about them.
+
+```{r Load}
+source(knitr::purl("12-load-nash.rmd"))
+fs::file_delete("12-load-nash.R")
+```
+
+I'm creating a dataframe in which duplicate permits are dropped via slicing. This dataframe was originally created and saved in `22`. For some reason, I've been finding duplicates still in these dataframes. I've taken all the important pieces of the code in `22` and put them in this chunk (with some slight modifications). This produces a df and writes to a file with the changes that I believe were intended in `22`. (NOTE - Now, no file is written in the EDA notebook.)
+
+```{r remove duplicate permits}
+nash_permits_unique <- nash_permits %>% 
+  mutate(status = recode(status,
+                         "CNCL" = "CANCELLED")) %>% 
+  mutate(status = case_when( ( (permit_type == "CADM") & (status == "HOLD") ) ~ "CANCELLED",
+                             ( (permit_type == "CADM") & (status %in% c("DONE", "ISSUED", "OK TO PAY")) ) ~ "EXPIRED",
+                             TRUE ~ status)) %>% 
+  group_by(permit_number) %>%
+  arrange(desc(date_issued)) %>% 
+  slice(1) %>% 
+  ungroup()
+```
+
+
+```{r write to feather}
+nash_permits_unique %>% 
+  write_feather(expand_boxpath("Nashville/nash_permits.feather"))
+```
+
+
+``` {r make_final}
+nash_model = nash_permits_unique %>%
+  select(permit_number:status, date_issued, const_cost,  final_insp_date) %>%
+#NOTE: may later also select: purpose, final_insp_date, construction_subtype, project duration
+  mutate(project_type = if_else(permit_type == "CADM", "demolition", "construction")) %>%
+  mutate(comm_v_res = if_else(str_detect(permit_type_description, "Residential"), "residential", "commercial")) %>%
+  mutate(comm_v_res = if_else(str_detect(permit_subtype_description, "Resid"), "residential", comm_v_res)) %>%
+  mutate(permit_number = as.character(permit_number)) %>%
+  ungroup() %>%
+  #removes signs since they don't generate waste
+  filter(permit_subtype_description != "Sign - Ground /  Wall Signs") %>%
+  #request from govt client, Allie, 
+  filter(permit_type_description != "Building Commercial - Change Contractor" & permit_type_description != "Building Residential - Change Contractor")
+
+nrow(nash_model)
+nash_model
+
+table(nash_model$project_type)
+table(nash_model$comm_v_res)
+
+write_feather(nash_model, expand_boxpath("Nashville/ready_for_first_model.feather"))
+```
+
+
+```{r ratios_EDA}
+
+#extra EDA requested by govt partners, does not change nash_permits
+
+nash_model
+
+#sets up data to be grouped by year and exclude cancelled permits
+#also creates column "sfh" to see if subtype is Single Family Home or not
+
+nash_ratios = nash_model %>%
+  mutate(year = format(as.Date(date_issued, format= "%m/%d/%Y"),"%Y")) %>%
+  mutate(sfh = permit_subtype_description=="Single Family Residence") %>%
+  filter(status %in% c("DONE","EXPIRED","ISSUED","OK TO PAY","OPEN","PENDING"))
+
+#analyzes counts of single family home vs non sfh residential permits over time
+
+nash_res_sfh_ratio = nash_ratios %>%
+  select(project_type, comm_v_res,year,sfh,permit_subtype_description) %>%
+  filter(comm_v_res =="residential") %>%
+  group_by(year,sfh) %>%
+  mutate (count = n()) %>%
+  select(year,sfh, count) %>%
+  distinct() %>%
+  drop_na() %>%
+  ungroup()
+
+barplot_sfh = ggplot(data = nash_res_sfh_ratio, aes( x = year, y = count, fill = sfh ) ) + 
+  geom_bar( stat = 'identity') +
+  geom_text(aes(label=count), vjust=-0.3, size=3)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  ggtitle("SFH vs non SFH Residential Permits")
+barplot_sfh
+
+#analyzes ratio of single family home as percent of residential permits over time
+
+nash_res_sfh_ratio3 = nash_res_sfh_ratio %>%
+  group_by(year) %>%
+  mutate(total = sum(count)) %>%
+  ungroup() %>%
+  #note the filter
+  filter(sfh == TRUE) %>%
+  mutate(sfh_ratio = count/total)
+  
+plot_ratio_res_sfh_nash = ggplot(data=nash_res_sfh_ratio3, aes(x=year, y=sfh_ratio, group=1)) +
+  geom_line()+
+  geom_point() +
+  geom_text(aes(label=sfh_ratio), vjust=-0.3, size=3)+
+  theme_minimal() +
+  ggtitle("Ratio of SFH to Residential Permits")
+
+plot_ratio_res_sfh_nash
+
+#analyzes ratio of single family home vs other top residential permits over time
+
+nash_subtypes_alt = nash_ratios %>%
+  select(project_type, comm_v_res,year,sfh,permit_subtype_description) %>%
+  filter(comm_v_res =="residential") %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate (count = n()) %>%
+  select(year,permit_subtype_description, count) %>%
+  distinct() %>%
+  drop_na() %>%
+  ungroup() %>%
+  group_by(year) %>%
+  mutate(total = sum(count)) %>%
+  ungroup() %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate(ratio = count/total) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  top_n(6) %>%
+  ungroup()
+  
+plot_alt = ggplot(data=nash_subtypes_alt, aes(x=year, y=ratio, group=permit_subtype_description)) +
+  geom_line(aes(color=permit_subtype_description))+
+  geom_point(aes(color=permit_subtype_description)) +
+  theme_minimal() +
+  ggtitle("Ratio of Top 6 Residential Subtypes over Time")
+
+plot_alt
+
+#commercial
+#analyzes ratio of top commercial permits over time
+
+nash_subtypes_com = nash_ratios %>%
+  select(project_type, comm_v_res,year,permit_subtype_description) %>%
+  filter(comm_v_res =="commercial") %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate (count = n()) %>%
+  select(year,permit_subtype_description, count) %>%
+  distinct() %>%
+  drop_na() %>%
+  ungroup() %>%
+  group_by(year) %>%
+  mutate(total = sum(count)) %>%
+  ungroup() %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate(ratio = count/total) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  top_n(7) %>%
+  ungroup()
+  
+#nash_subtypes_com  
+
+plot_com = ggplot(data=nash_subtypes_com, aes(x=year, y=ratio, group=permit_subtype_description)) +
+  geom_line(aes(color=permit_subtype_description))+
+  geom_point(aes(color=permit_subtype_description)) +
+  theme_minimal() +
+  ggtitle("Ratio of Top 7 Commercial Subtypes over Time")
+
+plot_com
+
+#all subtypes
+#analyzes ratio of top subtype permits over time, both comm and res
+
+nash_subtypes_all = nash_ratios %>%
+  select(project_type, comm_v_res,year,permit_subtype_description) %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate (count = n()) %>%
+  select(year,permit_subtype_description, count) %>%
+  distinct() %>%
+  drop_na() %>%
+  ungroup() %>%
+  group_by(year) %>%
+  mutate(total = sum(count)) %>%
+  ungroup() %>%
+  group_by(year,permit_subtype_description) %>%
+  mutate(ratio = count/total) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  top_n(7) %>%
+  ungroup()
+
+plot_all = ggplot(data=nash_subtypes_all, aes(x=year, y=ratio, group=permit_subtype_description)) +
+  geom_line(aes(color=permit_subtype_description))+
+  geom_point(aes(color=permit_subtype_description)) +
+  theme_minimal() +
+  ggtitle("Ratio of Top 7 Subtypes (Comm & Res) over Time")
+
+plot_all
+```
+

@@ -1,0 +1,175 @@
+---
+title: "42-synthetic-permits"
+output: html_notebook
+---
+
+```{r setup synthetic permits}
+source(knitr::purl("30-feature-engineering.Rmd", output = "tmp-30.R", quiet=TRUE))
+fs::file_delete("tmp-30.R")
+p_load(docstring, glue, splitstackshape)
+```
+
+This notebook contains functions which generate features for synthetic permits. Each feature will be generated in a different way. At the moment, the only features I actually need to generate are `comm_v_res`, `project_type`, and `const_cost`. The former two are generated based on user-input values (though maybe will ultimately be predicted). To generate `const_cost`, I need to assume a distribution values and draw from it. Because the distributions of `const_cost` are different depending on `comm_v_res` and `project_type`, we want to use the appropriate distribution given those values.
+
+Note -- docstrings for functions in this notebook can be viewed by running `docstring(function_name)`.
+
+# Driver function
+
+```{r generate synthetic permits}
+gen_syn_permits <- function(num_permits_sub, df_source, extra_cols = NULL, count_col = "count", ind_num = FALSE, seed = NULL){
+  #' Generate synthetic permits
+  #'
+  #' Generate a dataframe containing features of synthetic permits. The tibble `num_permits_sub` defines specific subtypes of interest and the number of desired permits for each subtype. The extra columns in `extra_cols` are generated via stratified bootstrap resampling of values in `df_source` (i.e., separately for each subtype defined in `num_permits_sub`).
+  #'
+  #' @param num_permits_sub (tibble) Categorical counts for each unique combination of subtypes
+  #' @param df_source (tibble) Source data from which features will be sampled
+  #' @param extra_cols (chr array, default = NULL) names of columns whose values will be generated via bootstrap resampling of `df_source`. If NULL all columns in `df_source` will be used.
+  #' @param count_col (chr, default = "count") name of the column in `num_permits_sub` containing counts of each subtype. Assumed/default name is "count".
+  #' @param ind_num (bool, default = FALSE) If TRUE, sampling of each extra column in `extra_cols` is done independently. If FALSE, entire rows of `df_source` are sampled, roughly preserving correlations. Default is FALSE
+  #' @param seed (num, default = NULL) random seed
+  #'
+  #' @return (tibble) Synthetic permits
+  #' @export
+  #'
+  #' @examples
+  #' # After loading nash_permits
+  #' 
+  #' gen_syn_permits(num_permits_sub = tibble(project_type = c("construction", "construction", "demolition", "demolition"),
+  #'                                          comm_v_res = c("commercial", "residential", "commercial", "residential"),
+  #'                                          count = c(20, 5, 7, 2)),
+  #'                 df_source = nash_permits)
+  
+  if(ind_num){
+    stop(glue("The thing is...I haven't set up the code to independently bootstrap numerical columns."))
+  }
+  
+  # set seed
+  set.seed(seed)
+  
+  # get categorical columns
+  forecast_cols <- num_permits_sub %>% 
+    select(-!!count_col) %>% 
+    colnames()
+  
+  # get columns to sample if not passed (from source dataframe)
+  if(is.null(extra_cols)){
+    extra_cols <- colnames(df_source)
+    extra_cols <- extra_cols[!(extra_cols %in% forecast_cols)]
+  }
+
+  # Get counts for each subclass in a form usable by `stratified`
+  combo_list <- num_permits_sub %>% 
+    get_combo_list(count_col = count_col)
+
+  # Generate synthetic permits by stratified resampling of source dataframe
+  syn_permits <- df_source %>% 
+    stratified(forecast_cols, combo_list, replace=TRUE) %>% 
+    select(all_of(forecast_cols), all_of(extra_cols))
+  
+  return(syn_permits)
+}
+```
+
+
+```{r get list of combined }
+get_combo_list <- function(df, count_col = "count"){
+  #' Get list of counts for categorical variable combinations
+  #'
+  #' Given a dataframe containing categorical variables and subtype counts (i.e., the output of `group_by(a, b)` followed by `summarise(count=n()`), return a named list where the names are the space-separated concatenations of the values in the grouped variables and the vaue is the counts. This list is useful for stratified resampling via `splitstackshape::stratified`.
+  #'
+  #' @param df (tibble) Categorical variables and counts for each grouped combo of variables.
+  #' @param count_col (chr, default = "count") name of the column in `df` containing counts of each subtype.
+  #'
+  #' @return (list) Counts for categorical variable combinations (space-separated concatentations)
+  #' @export
+  #'
+  #' @examples
+  #' get_combo_list(df = tibble(project_type = c("construction", "construction", "demolition", "demolition"),
+  #'                                             comm_v_res = c("commercial", "residential", "commercial", "residential"),
+  #'                                             count = c(20, 5, 7, 2)))
+  
+  df %>% 
+    unite(combo, !(!!count_col), sep=" ") %>% 
+    pivot_wider(names_from = combo, values_from = {{count_col}}) %>% 
+    as.list()
+}
+```
+
+
+# Miscellaneous helper functions
+
+## Load dataframes from which we construct distributions
+
+```{r load dataframe for specific cities}
+load_source_df <- function(city = "nashville"){
+  #' Load permit dataframe for specified city
+  #'
+  #' Load in a dataframe with construction & demolition permit information, given the name of a valid city. If an invalid name is supplied no dataframe is loaded.
+  #'
+  #' @param city (chr, default="nashville') Name of city.
+  #'
+  #' @return (tibble) Features of construction/demoltion permits.
+  #' @export 
+  #'
+  #' @examples
+  #' load_source_df(city="nashville")
+  
+  if(city!="nashville"){
+    stop("Temporarily, nashville is the only valid source city for synthetic permit generation")
+  }
+  # fname <- expand_boxpath("Nashville/adams_nashville_no_touching.feather")
+  # df <- read_feather(fname)
+
+  df <- load_permits(city = city) %>%
+    filter(generates_debris) %>%      # only permits deemed to generate debris
+    filter(comm_v_res!="other")       # I suspect these should be removed
+    
+  return(df)
+}
+```
+
+
+## Test function
+Here is a function to test whether or not the permit generation is working. Right now, I simply print out the number of permits generated of each subtype. This is pretty rudimentary. Eventually, adding some visualization or explicit checks would be nice.
+
+```{r test syn permits}
+run_sim_test <- function(){
+  
+  # load nashville
+  nash_permits <- load_source_df()
+  
+  forecast_cols = c("comm_v_res", "project_type")
+  extra_cols = c("const_cost","construction_subtype", "permit_subtype_description", "council_dist")
+  
+  num_permits_sub <- 
+    nash_permits %>% 
+    group_by(across(all_of(forecast_cols))) %>% 
+    summarise(count = n()) %>% 
+    ungroup()
+  
+  # generate synthetic permits
+  syn_permits <- gen_syn_permits(num_permits_sub, nash_permits, extra_cols = extra_cols)
+  
+  syn_totals <- syn_permits %>% 
+    group_by(across(all_of(forecast_cols))) %>% 
+    summarise(count = n()) %>% 
+    ungroup()
+  
+  # syn_totals and num_permits_sub should be the same
+  if(identical(num_permits_sub, syn_totals)){
+    print("Produced expected number of permits of each subtype. Looking good!")
+  }
+  else{
+    stop("Something went wrong with the test. Did not produce expected number of permits of each subtype.")
+  }
+  
+  return(syn_permits)
+}
+```
+
+
+Call the test function.
+```{r run test,purl=FALSE}
+run_sim_test()
+```
+

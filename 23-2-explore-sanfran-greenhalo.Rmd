@@ -1,0 +1,478 @@
+---
+title: "23-2-explore-sanfran-greenhalo"
+output:
+  html_notebook:
+    toc : true
+    theme : united
+---
+
+```{r 23-2-explore-sanfran-greenhalo, echo=FALSE, include=FALSE}
+source(knitr::purl("13-load-sanfran.Rmd"))
+fs::file_delete("13-load-sanfran.R")
+source(knitr::purl("20-data-exploration.Rmd"))
+fs::file_delete("20-data-exploration.R")
+```
+
+# Data overview
+
+The Green Halo dataset contains information related to C&D debris. This dataset only spans 1.5 years and contains 421 entries:
+
+```{r tonnage dimensions}
+dim(sanfran_tonnage)
+```
+
+Let's start by looking at missing values.
+```{r tonnage missing}
+plot_missing(sanfran_tonnage)
+```
+
+The immediate thing that stands out to me is that we have extremely high percentages (>90%) of missing values for most of the materials. It's a bit tough to see, so let's zoom in on the material-level data:
+
+```{r materials missing}
+sanfran_tonnage %>% 
+  select(asphalt_pavement_grinding:wood_clean) %>% 
+  plot_missing()
+```
+
+Thus, most of the material-level data is missing. (**Note -- As discussed in 13-load-sanfran.Rmd, there are in fact 65 other columns that we drop because they have no entries. These are all material-level data.) We still have ~23% of the values for metal and ~56% mixed debris, so we could perhaps make some conclusions about those materials. All of the others are missing more than 90% (meaning we only have <40 entries). These would be difficult to predict. I'm not certain which materials we care about. That's a question for Jenn and Allie. Additionally, I don't know why most values are missing. Do the companies not have to report these materials? Or are their projects just not producing them?
+
+**Note-- it just occurred to me that I'm not sure what these material columns are. I assume they are the total amount of material of this type produced. Is this being landfilled? Recycled?**
+
+Fortunately, when it comes to the aggregated columns, we're not missing any information. That is to say, we have all the information about the total amounts of reused/recycled/disposed materials for these projects. So this information can definitely inform Project Goal 1 (predicting total amounts). Here I print the number of NA values for the aggregated columns:
+
+```{r totals missing}
+sanfran_tonnage %>% 
+  select(reuse,recycling,disposed,total) %>% 
+  map(~sum(is.na(.)))
+```
+
+However, a large amount of our data contains zero debris generated. Here is a simple bar chart showing how many permits in this set did and did not produce debris.
+
+```{r tonnage fraction nonzero}
+sanfran_tonnage %>% 
+  mutate(debris_status = ifelse(total>0, "Produce debris", "No debris")) %>% 
+  select(debris_status) %>% 
+  plot_bar()
+```
+
+It's about 3/5 of the permits that actually produce debris. With this in mind, it's worth revisiting the above plot of material-level missing values. If we only consider the permits that produced debris, what does the material-level missing values look like?
+
+```{r materials missing nonzero total}
+sanfran_tonnage %>% 
+  filter(total>0) %>% 
+  select(asphalt_pavement_grinding:wood_clean) %>% 
+  plot_missing()
+```
+
+If we consider only permits with non-zero total debris, about 90% of these permits have a non-NA value for mixed_c_d_debris. For the other materials, the amounts of missing values are still very high. Out of curiosity, if I select everything that has a total tonnage of zero, what do the numbers of missing values look like?
+
+```{r materials missing zero total}
+sanfran_tonnage %>% 
+  filter(total==0) %>% 
+  select(asphalt_pavement_grinding:wood_clean) %>% 
+  plot_missing()
+```
+
+Good! This result makes sense. Every case where the total tonnage is zero has no material-level tonnage. We will likely just need to drop these entries with zero total tonnage.
+
+We'll return to exploring the material level info later in this notebook.
+
+# Repeat permit entries
+
+For the permits dataset, we found a great deal of repeat permit entries. Is this the case for Green Halo? Here I print the number of distinct permit entries
+
+```{r green halo repeats}
+sanfran_tonnage %>% 
+  select(permit_number) %>% 
+  n_distinct()
+```
+
+This is the same as the total. There are no repeat entries in Green Halo. We'll look more at the permit entries in a bit.
+
+# Permit statuses
+
+In Green Halo, there are four statuses. This differs from the permits set, which contains only FILED/ISSUED.
+
+```{r green halo statuses}
+sanfran_tonnage %>%
+  select(status) %>%
+  plot_bar()
+```
+
+I'm curious about the distinction between "Final" and "Completed".
+Let's do a little more exploration on which of these statuses are producing debris Below, the plot shows, for each status, the number of permits that produced debris (turqoise) and the number that did not (red).
+
+```{r debris by status}
+sanfran_tonnage %>%
+  mutate(debris_status = ifelse(total>0, "Produce debris", "No debris")) %>%
+  group_by(status,debris_status) %>%
+  mutate(counts=n()) %>%
+  ggplot(aes(x=status, y=counts, fill=debris_status)) +
+  geom_bar(stat='identity', position='dodge')
+```
+
+There are several things to comment on here:
+
+* All submitted produce no debris. This makes sense as these projects would not have filed final reports.
+
+* Some approved produce debris, some do not. Do they have to file mid-project reports?
+
+* One entry for approved and one for final (I checked) do not produce debris. What's going on with these?
+
+First let's look at permit with a "Final" status but no debris:
+
+```{r final no debris}
+sanfran_tonnage %>%
+  filter(total==0 & status=="Final") %>%
+  select(permit_number, contains("date"))
+```
+
+That's pretty odd. The date approved is after the end date. This is the only peculiarity I noticed.
+
+Now let's look at the case where the status is "Completed" and there is no debris:
+
+```{r completed no debris}
+sanfran_tonnage %>%
+  filter(total==0 & status=="Completed") %>%
+  select(permit_number, contains("date"))
+```
+
+The close date and start date are the same here. In my opinion, both this and the previous one seem like they are not labeled correctly, but it's tough to be sure.
+
+Last, let's see if we can figure out why some approved projects generate debris and others do not. One thought is that any differences would be reflected in the dates. Maybe, the dates for the projects that generate debris are different than the dates for those that do not. Here I print out the average dates for debris approved projects and non-debris approved projects. (**Note -- I also looked at the date ranges, but I find this to be more instructive.)
+
+```{r approved debris date ranges}
+sanfran_tonnage %>%
+  filter(status=="Approved") %>% 
+  mutate(debris_status = ifelse(total>0, "Produce debris", "No debris")) %>%
+  group_by(debris_status) %>%
+  summarise(across(contains("date"), mean, na.rm=TRUE))
+```
+
+The average start date of the no-debris projects is slightly later than those that produce debris. But they're both still quite similar. The average end dates are roughly the same (and notably happened already -- so why do we not have debris for all?). The close dates are all missing for the no-debris projects, so you might think this column is the key. But a quick check shows that close dates are also missing for 99% of the debris projects.
+
+```{r missing close date approved plus debris}
+sanfran_tonnage %>% 
+  filter(status=="Approved"&total>0) %>% 
+  select(close_date) %>% 
+  plot_missing()
+```
+
+Thus, I really do not know why some approved generate debris and others do not. (**More discussion in Issue #36.**)
+
+**UPDATED EDA**
+
+See Issue #107 for more discussion.
+
+We believe that, in cases where `status=="Approved"`, the value of the tonnage is an estimate. We want to know if we should use these estimates when training/testing our model. Here's a comparison overall with a box-and-whisker plot. I'm looking at only those GH permits for which we have debris values. The real thing to compare here is the green box to the purple box. If they're the same, then there's no reason to not include the green. I think they're similar enough:
+
+```{r nonzero debris by status}
+sanfran_tonnage %>% 
+  filter(total>0) %>% 
+  mutate(status = if_else(status%in%c("Completed","Final"), "Completed/Final", status)) %>% 
+  boxplot(log10(total)~status,.,
+          ylab = "Green Halo status",
+          xlab = "log10(Debris tonnage)",
+          main = "Green Halo debris by status",
+          varwidth = TRUE,
+          col = c("green","purple"),
+          horizontal = TRUE)
+```
+
+It may be the case that the subpopulations (e.g. residential construction) of permit types in each of these groups is different, leading to small differences in debris. We can see this by explicitly looking at them:
+
+```{r permit subpopulations by status}
+sanfran_tonnage_reclass <- sanfran_tonnage %>% 
+  filter(total>0) %>% 
+  mutate(status = if_else(status%in%c("Completed","Final"), "Completed/Final", status)) %>% 
+  mutate(building_type = recode(building_type,
+                                "1. Single Family" = "residential",
+                                "2. Multifamily (2-4 units)" = "residential",
+                                "3. Multifamily (5-19 units)" = "residential",
+                                "4. Multifamily (20+ units)" = "residential",
+                                "5. Mixed Use (w/ 2-4 res. units)" = "commercial",
+                                "6. Mixed Use (w/ 5-19 res. units)" = "commercial",
+                                "7. Mixed Use (w/ 20+ res. units)" = "commercial",
+                                "8. Non-Residential/ Commercial" = "commercial",
+                                "9. Municipal" = "commercial")) %>%
+  mutate(project_type = if_else(project_type=="demolition", project_type, "construction")) 
+
+sanfran_tonnage_reclass%>% 
+  group_by(project_type,building_type, status) %>% 
+  summarise(count=n())
+```
+
+Or, for the more visual learners, we can compare pie charts within the two subpopulations:
+
+```{r subpop pie charts}
+sanfran_tonnage_reclass <- sanfran_tonnage_reclass %>% 
+  mutate(subpop = str_c(building_type,project_type,sep=" "))
+
+sanfran_tonnage_reclass %>% 
+  filter(status=="Approved") %>% 
+  ggplot(aes(x="", y="", fill=subpop)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  labs(title = "Approved permits subpopulations")
+
+sanfran_tonnage_reclass %>% 
+  filter(status!="Approved") %>% 
+  ggplot(aes(x="", y="", fill=subpop)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  labs(title = "Final/Completed permits subpopulations")
+```
+
+Thus, the differences might be due to Approved vs. Final/Completed having different proportions of each subpopulation. For example, there is a higher fraction of demo projects (which produce more debris) in final/completed vs approved. Overall, I can't say that the small differences between the distributions in the overall plot are actually due to estimation failures. 
+
+For what it's worth, here's the same box-and-whisker plot using just commercial construction:
+
+```{r comm const by status}
+sanfran_tonnage_reclass %>% 
+  filter(project_type=="construction"&building_type=="commercial") %>% 
+  boxplot(log10(total)~status,.,
+          ylab = "Green Halo status",
+          xlab = "log10(Debris tonnage)",
+          main = "Green Halo commercial construction debris by status",
+          varwidth = TRUE,
+          col = c("green","purple"),
+          horizontal = TRUE)
+```
+
+These look very similar to me. We concluded we should include the Approved debris-generating permits in our model.
+
+**NOTE -- My classifications here of what's commercial vs. residential are based on the column `building_type` in Green Halo. In `33`, I do the classification based on `existing_use` from the permit dataset. These largely overlap, but there are differences. For this test, it doesn't make much difference, though it certainly is a point worth considering. I'll say no more here.**
+
+# Construction and demolition
+
+The original Green Halo dataset had a column "project_type" with the following possibilities. I recoded them for GH as seen below:
+
+* "3. Full Demolition/Deconstruction (DBI Form No.6)" = "demolition"
+
+* "4. Alteration (DBI Form No.3 or 8)" = "alteration"
+
+* "1. New Construction (DBI Form No.1)" = "construction"
+
+* "2. New Wood Construction (DBI Form No.2)" = "wood_construction"
+
+Here is a breakdown of the different project types:
+
+```{r gh proj type}
+sanfran_tonnage %>%
+  select(project_type) %>%
+  plot_bar()
+```
+
+The biggest thing happening here is alterations. There's very little construction. We've focused a lot on the C/D ratios, but alterations here are dominating. I don't see the need for the wood_construction category. This seems it can be just relabeled as "construction." I would also like to see the DBI form. I make more comments on the comparison between this and the permits set in 23-1-explore-sanfran-permits.Rmd.
+
+Let's look at the total debris generated for each type category to investigate the C/D debris ratio. I filter out all projects that generate no debris and create a summary dataframe here.
+
+```{r ave and total debris}
+sf_debris_summary <- sanfran_tonnage %>%
+  filter(total>0) %>%
+  group_by(project_type) %>%
+  summarise(total_debris = sum(total), average_debris = mean(total)) %>%
+  mutate(perc_total = total_debris/sum(total_debris)) %>%
+  select(project_type,perc_total,total_debris,average_debris) %>%
+  arrange(desc(perc_total))
+```
+
+Here is a pie chart of the total debris generated by each project type:
+
+```{r total debris pie}
+sf_debris_summary %>% 
+  ggplot(aes(x="", y=total_debris, fill=project_type)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0)
+```
+
+Demolition is accounting for ~80% of the debris generated in Green Halo.
+
+On a per project basis, the proportions are different. Here is a pie chart of the average debris generated by projects (only again including the ones that generate debris).
+
+```{r ave debris bar}
+sf_debris_summary %>% 
+  # arrange(desc(average_debris)) %>% 
+  # mutate(project_type = factor(project_type, levels=project_type)) %>% 
+  ggplot(aes(x=project_type, y=average_debris, fill=project_type)) +
+  geom_bar(stat="identity", width=1)
+```
+
+The average amount of debris generated in demolition projects is about five times what it is in construction projects. Admittedly, the sample size here is pretty small.
+(**Note -- here I'm not arranging by size of the bar, so that the colors are consistent with those above. I should just explicitly set the colors.**)
+
+# Green Halo peculiar permits
+
+Most of the permit entries should start with the year (which will always be "20"). Here we check for permits not meeting this condition. They are also generally of a particular length. One way to capture all of the oddities is just be checking the length of the permit number. I use a "good" permit number to do so:
+
+```{r bad permit entries}
+permit_length <- nchar("202008242510")
+
+bad_permits <-sanfran_tonnage %>% 
+  filter( !startsWith(permit_number,"20") | nchar(permit_number)!=permit_length) %>% 
+  extract(address, c("street_number", "street_name"), regex = "([[:digit:]-]+)\\s(.*)" ) %>% 
+  separate(street_name, into = c("street_name"), sep=" ") %>% 
+  mutate(street_name = str_to_upper(str_remove(street_name, ","))) %>% 
+  select(permit_number, street_name, street_number, everything())
+bad_permits
+```
+
+As you can see, some of these permits look like maybe they have misformatted permit numbers that can easily be replaced. Others look as though we might just have to check for matching addresses in the permits dataset.
+I added a mutate above to get the street name and street number as separate columns. This will be used to check for a match in the permits dataset (and thus obtain a "good" permit number).
+
+Let's start with the easy ones. The entries for Clay and Owens look like they have useable permit numbers. There are two real-looking permits associated with each of these (the "EW" ones for Owens are the same). There's probably a smarter way to do this, but I'm just going to explicitly copy them here:
+
+```{r fixable bad permits}
+sanfran_permits %>% 
+  filter(application_number %in% c(201911217868, 201911207806, 202008242510, 202010281343)) %>% 
+  arrange(application_number) %>% 
+  group_by(application_number) %>% 
+  summarise(count = n())
+```
+
+There are many duplicated permits in the permits set. That's another story. But the above output shows that we have a match for three of these four permits. We do not match the "EW" permits, whatever those are. But we still have valid entries for each of these in the permits set
+
+Now let's work on address-matching for the others. I use a filter here to cut out the two we just analyzed and then try to join using street_name/street_number to permits
+
+```{r address matching}
+bad_permits %>% 
+  filter(nchar(permit_number)<20) %>%
+  left_join(sanfran_permits, by=c("street_number"="street_number",
+                                  "street_name"="avs_street_name")) %>% 
+  filter(!is.na(application_number)) %>% 
+  rename(gh_id = permit_number,
+         permit_id = application_number,
+         gh_cost = project_value,
+         permit_cost_est = estimated_cost,
+         permit_cost_rev = revised_cost,
+         gh_app_date = date_approved,
+         permit_status_date = status_date,
+         gh_proj_type = project_type,
+         permit_proj_type = form_number
+         ) %>% 
+  select(street_number, street_name, gh_id, permit_id, gh_cost, permit_cost_est,
+         permit_cost_rev, gh_app_date, permit_status_date, gh_proj_type, 
+         permit_proj_type, everything())
+```
+
+Okay, first takeaway is that only two of the six "bad" permits in GH have address matches in the permits set. I organized the above output so that the relevant columns between GH and permits can be compared. The general conclusion is these really don't match up. These are likely all different projects that occurred at the same Here are specifics:
+
+* IDs - There are several permit IDs for each GH ID. These are probably all different projects then.
+
+* Cost - Neither the estimated nor revised permit costs match up with the GH cost in any instance.
+
+* Dates - There are a lot of dates to consider. This might not really need to match, but it doesn't.
+
+* Project type - forms 3/8 are alterations, 1 is construction. The first GH permit (EVANS) has no match for demolition (would be 6 or maybe 5). The second GH permit (GRANT) matches on this.
+
+The overall conclusion here is that we can fix two of the eight bad GH permits and find a match in the permits set. One of these actually has two permit IDs associated with it, so we need to determine how to handle that. The other six just will get missing values for any data we bring in from permits.
+
+For the Clay St. entry (with two permits), the biggest thing to decide is how to handle the costs and dates. Below I'm printing out some information for the two permit entries (but there are eight because of repeats) and the corresponding GH entry:
+
+```{r fixing clay st.}
+sanfran_permits %>% 
+  filter(application_number %in% c(201911217868,201911207806)) %>% 
+  select(application_number, estimated_cost, revised_cost, status_date, expiration_date) %>% 
+  arrange(application_number)
+
+bad_permits %>% 
+  head(1) %>% 
+  select(permit_number, project_value, start_date, end_date)
+```
+
+It seems like we can just take the latest dates from the permits set. These aren't terribly different. I notice that the sum of the `revised_cost` across the two permits is equal to the `project_value` for the GH entry. So it seems reasonable to take the sum (and also, maybe we should use `revised_cost`?).
+
+# Dates
+
+Let's do a little investigation regarding the dates for the Green Halo set. This data only contains permits filed within a 1.5 year span.
+**(Side note -- when we consider debris generated, which dates do we care about? Start dates, end dates? If a project takes 2 years, it's generating debris throughout all of those years. It's probably important to include some duration info.)**
+
+Here is the range of start dates for the SF Green Halo set:
+
+```{r SF tonnage date ranges}
+sanfran_tonnage %>%
+  summarise(range(start_date))
+```
+
+Let's think about the dates a bit. First let's zoom in and get a picture of which dates are missing.
+
+```{r tonnage missing dates}
+sanfran_tonnage %>%
+  select(contains("date")) %>%
+  plot_missing()
+```
+
+The entries missing approval dates are all applications that were submitted, but not yet approved. I took a peek at their start dates below. They span a pretty big block of starting dates. There's nothing here particularly that I notice (i.e., they weren't all recently submitted). These all also haven't produced any debris, which makes sense.
+
+```{r missing approval dates}
+sanfran_tonnage %>%
+  filter(is.na(date_approved)|status=="Submitted") %>%
+  select(start_date,date_approved,status,total) %>%
+  arrange(desc(start_date))
+```
+
+# Building type
+
+In the permits set, we had about 95 different building type categories. Here, there are only eight:
+
+```{r building type}
+sanfran_tonnage %>%
+  filter(total>0) %>% 
+  select(building_type) %>%
+  plot_bar()
+```
+
+We can easily collapse these to residential, commercial, municipal, and mixed. Not sure if the extra information (e.g. single/multiple families, number of residents) will become useful. We may wish to extract that info and stick it in another column.
+
+# Green Halo missing materials
+
+We wondered whether, for cases where the mixed c&d debris column has a value, there was at least one other material column with a non-NA entry. The thought is that mixed c&d might encompass some of the other columns. Below I filter out all the NA mixed_c_d_debris values and then check whether or not each permit has a material entry in one of the other columns. This is then shown as a bar plot where TRUE indicates that there was an entry in one of the other material columns:
+
+```{r material given cd debris}
+sanfran_tonnage %>%
+  filter(!is.na(mixed_c_d_debris)) %>%
+  select(c(asphalt_pavement_grinding:wood_clean)) %>%
+  select(!mixed_c_d_debris) %>%
+  mutate(has_material_entry_given_cd = ifelse(rowSums(., na.rm = TRUE)>0, "has material", "no material")) %>%
+  select(has_material_entry_given_cd) %>%
+  plot_bar()
+```
+
+So, for the permits where we have a mixed c&d entry, a little less than half of the permits also have another material entry.
+
+We can also ask a related question. When the total debris is nonzero and the mixed_c_d_debris is NA, how often do we have another material entry. Here is that plot:
+
+```{r material given no cd}
+sanfran_tonnage %>%
+  filter(total>0) %>%
+  filter(is.na(mixed_c_d_debris)) %>%
+  select(c(asphalt_pavement_grinding:wood_clean)) %>%
+  select(!mixed_c_d_debris) %>%
+  mutate(has_material_entry_given_no_cd = ifelse(rowSums(., na.rm = TRUE)>0, "has material", "no material")) %>%
+  select(has_material_entry_given_no_cd) %>%
+  plot_bar()
+```
+
+Okay, this is reassuring. Combined with the previous figure, this means that, for cases where the total tonnage is nonzero, there is at least one material entry, whether its mixed_c_d or something else. Here's a more direct way to verify this:
+
+```{r any material given some debris}
+sanfran_tonnage %>%
+  filter(total>0) %>%
+  select(c(asphalt_pavement_grinding:wood_clean)) %>%
+  mutate(has_any_material_given_debris = ifelse(rowSums(., na.rm = TRUE)>0, "has material", "no material")) %>%
+  select(has_any_material_given_debris) %>%
+  plot_bar()
+```
+
+And just for a complete sanity check, I imagine that cases where the total debris equals zero should not have any material entry. This is true -- below I count the number of non-NA entries in the whole dataframe. It's zero:
+
+```{r num non-NA materials given no debris}
+sanfran_tonnage %>%
+  filter(total==0) %>%
+  select(c(asphalt_pavement_grinding:wood_clean)) %>%
+  mutate(num_non_missing = rowSums(!is.na(.))) %>%
+  select(num_non_missing) %>%
+  colSums()
+```
+
+

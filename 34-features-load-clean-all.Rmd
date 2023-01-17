@@ -1,0 +1,74 @@
+
+---
+title: "34-feature-engineering"
+output: html_notebook
+---
+
+This notebook cleans and merges all city dataframes into one comprehensive dataframe.
+
+```{r load}
+source(knitr::purl("10-load-data.Rmd"))
+fs::file_delete("10-load-data.R")
+
+mdl_list <- list('Austin, TX', 'Nashville', 'San Fran, CA')
+dfs <- mdl_list %>%
+   map(~read_feather(expand_boxpath(str_c(., '/ready_for_first_model.feather')))) 
+
+austin_permits <- as.data.frame(dfs[1])
+nash_permits <- as.data.frame(dfs[2])
+sanfran_permits <- as.data.frame(dfs[3])
+
+#appends city id to prevent duplicate permit numbers during merge of datasets
+
+set_permit_prefix <- function(df, prefix) {
+  
+  df <- df %>%
+    mutate(permit_number <- str_c(prefix, '-', permit_number))
+  
+  return(df)
+}
+
+nash_permits <- set_permit_prefix(nash_permits, "NSH")
+austin_permits <- set_permit_prefix(nash_permits, "AUS")
+sanfran_permits <- set_permit_prefix(nash_permits, "SAN")
+```
+
+
+
+
+
+```{r merge_df}
+
+#merge nashville and austin
+
+nash_austin_df <- bind_rows(nash_permits, austin_permits)
+nash_austin_df
+
+tail(nash_austin_df)
+
+#merge nashville/austin with san fran
+
+all_permits_df <- bind_rows(nash_austin_df, sanfran_permits)
+all_permits_df
+
+tail(all_permits_df)
+nrow(all_permits_df)
+
+#final dataframe cleaning
+
+all_permits_clean <- all_permits_df %>% 
+  filter(const_cost > 1) #based on Allie's recommendation to not count projects of 1 or 0 dollars
+
+all_permits_clean
+nrow(all_permits_clean)
+
+#filtering out these low cost permits only reduces dataset by 3%
+
+
+```
+
+```{r write_new_df}
+
+write_feather(all_permits_clean, expand_boxpath("all_permits.feather"))
+
+```

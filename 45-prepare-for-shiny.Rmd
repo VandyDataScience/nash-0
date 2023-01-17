@@ -1,0 +1,135 @@
+---
+title: "45-prepare-for-shiny"
+output: html_notebook
+---
+
+
+# Prepare for Shiny
+
+To reduce the amount of data involved in the Shiny app, we are performing all of the filters and computing summary statistics here, then saving the output.
+
+Below, we add the desired cost categories. These need to be treated as a factor so that the `group_by` below can include empty groups when performing summary statistics (this is a peculiarity of how `group_by` works). If we do not have values for every possible filter combination, I believe the app will break.
+
+```{r main prep function}
+prepare_for_shiny <- function(permits_fname, forecast_fname){
+  
+  # Read data
+  syn_permits <- read_feather(permits_fname) %>% 
+    filter(fy>2021&fy<2027) %>% 
+    mutate(cost_cat = as.factor(case_when(is.na(const_cost) ~ NA_character_,
+                                          const_cost<50000 ~ "0-50k",
+                                          const_cost<500000 ~ "50k-500k",
+                                          const_cost<3000000 ~ "500k-3M",
+                                          const_cost<20000000 ~ "3M-20M",
+                                          TRUE ~ ">20M")))
+  
+  # Read/write forecast to correct location
+  read_feather(forecast_fname) %>% 
+    write_feather("nash-zero-shiny/shiny-data/best_forecast.feather")
+  
+  # debris summary
+  group_cats <- c("comm_v_res","project_type","cost_cat")
+  syn_permits %>% 
+    summarise_shiny(group_cats, "fiscal_year") %>% 
+    bind_rows(summarise_shiny(syn_permits, group_cats, "fiscal_quarter")) %>% 
+    mutate(cost_cat = as.character(cost_cat)) %>% 
+    mutate(across(all_of(group_cats), ~replace_na(.x, "All"))) %>% 
+    mutate(comm_v_res = str_to_sentence(comm_v_res)) %>% 
+    mutate(project_type = str_to_sentence(project_type)) %>% 
+    filter(!(fiscal_year%in%c("FY 21", "FY 27"))) %>% 
+    filter(!(fiscal_quarter%in%c("FY 21 - Q4", "FY 27 - Q1", "FY 27 - Q2", "FY 27 - Q3", "FY 27 - Q4"))) %>% 
+    write_feather("nash-zero-shiny/shiny-data/syn_permit_summary.feather")
+  
+  # map summary
+  group_cats <- c("comm_v_res","project_type")
+  
+  syn_permits %>% 
+    summarise_shiny_map(group_cats, "fiscal_year") %>% 
+    mutate(across(all_of(group_cats), ~replace_na(.x, "All"))) %>% 
+    mutate(comm_v_res = str_to_sentence(comm_v_res)) %>% 
+    mutate(project_type = str_to_sentence(project_type)) %>% 
+    filter(fy>2021 & fy<2027) %>%
+    write_feather("nash-zero-shiny/shiny-data/map_summary.feather")
+}
+```
+
+
+
+This function below could probably be generalized, but I don't know if I want to. For now, it takes in the permits dataframe, a list of grouping categories, and a time quantity (fiscal_year or fiscal_quarter). It will return a summary (median and desired quantiles) for the requested groupings. (Summary stats are computed across samples.)
+
+```{r debris summary function}
+debris_summ <- function(df, group_cats, time){
+  
+  ts <- rlang::sym(time)
+  df %>% 
+    group_by(!!ts, sample, across(all_of(group_cats)),.drop = FALSE) %>% 
+    summarise(debris = sum(total_debris, na.rm=TRUE)) %>% 
+    ungroup() %>%
+    group_by(!!ts, across(all_of(group_cats))) %>%
+    summarise(total_debris = median(debris),
+              q_05 = quantile(debris, 0.05),
+              q_25 = quantile(debris, 0.25),
+              q_75 = quantile(debris, 0.75),
+              q_95 = quantile(debris, 0.95)) %>%
+    ungroup()
+}
+```
+
+
+```{r summary for shiny}
+summarise_shiny <- function(df, group_cats, time){
+
+  # all cats
+  df_summ <- df %>% 
+    debris_summ(group_cats, time)
+  
+  # no cats plus bind
+  df_summ <- df_summ %>% 
+    bind_rows(debris_summ(df, c(), time))
+  
+  # single and double groupings plus bind
+  for(cat in group_cats){
+    gcats <- group_cats[!(group_cats %in% c(cat))]
+    df_summ <- df_summ %>% 
+      bind_rows(debris_summ(df, cat, time)) %>% 
+      bind_rows(debris_summ(df, gcats, time))
+  }
+  return(df_summ)
+}
+```
+
+```{r map summary func}
+map_summ <- function(df, group_cats, time){
+  
+  df %>% 
+    group_by(fy, sample, council_dist, across(all_of(group_cats)), .drop = FALSE) %>%
+    mutate(npermits = n()) %>% 
+    mutate(across(c(total_debris, const_cost), mean, na.rm = TRUE, .names = "{.col}_mean")) %>% 
+    mutate(total_debris = sum(total_debris, na.rm=TRUE)) %>% 
+    ungroup() %>% 
+    group_by(fy, council_dist, across(all_of(group_cats))) %>% 
+    summarise(across(c(total_debris, total_debris_mean, const_cost_mean, npermits), mean, na.rm = TRUE)) %>% 
+    ungroup()
+}
+```
+
+```{r map summary shiny}
+summarise_shiny_map <- function(df, group_cats, time){
+
+  # all cats
+  df_summ <- df %>% 
+    map_summ(group_cats, time)
+  
+  # no cats plus bind
+  df_summ <- df_summ %>% 
+    bind_rows(map_summ(df, c(), time))
+  
+  # single and double groupings plus bind
+  for(cat in group_cats){
+    df_summ <- df_summ %>% 
+      bind_rows(map_summ(df, cat, time))
+  }
+  return(df_summ)
+}
+```
+

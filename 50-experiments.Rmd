@@ -1,0 +1,20 @@
+---
+title: "50-experiments"
+output: html_notebook
+---
+
+Running the modeling pipeline under different conditions. Each unique set of conditions is termed an "experiment". Several experiments can be grouped together in one notebook where appropriate. The purpose of having multiple experiments is more or less to see how our predictions change under different sets of assumptions. Some possible examples of things to vary from one experiment to another are:
+
+* _Source of forecasts_ We build forecasts off data from Nashville, but we could do so using data from other cities. This could (roughly) be used to answer the question, "What if we implemented the policies of San Francisco/Austin?"
+
+* _The source of uncertainty_ Bootstrapping features vs. sampling from some fit cdf (see `42`) when generating synthetic permits is one way to do this. Multivariate vs. univariate bootstrapping is another way to do this. Alternatives to Gaussian draws from the forecasts (`40`+`41`) could be considered.
+
+* _Source of features_ We build the synthetic permits (`42`) using real permits from the last five years in Nashville. We could instead use a different city or a shorter timespan (i.e., only use data from the most recent year in Nashville).
+
+Here are things we do not intend to change from one experiment to another:
+
+* _The tonnage prediction model_ We will choose the best-performing model in `44`. As such, different experiments are not intended to check the predictions of worse-performing models against the better model. (A potential exception to this is if, in the future, more data becomes available with which we could train a new model.)
+
+Last, here are things that _could_ change, but maybe we should just stick to one:
+
+* _The forecasts_ We currently build simple time series forecasts of `npermits` for all the subtypes that can be constructed from the categorical columns `project_type` and `comm_v_res`. We could (a) use different categorical columns or (b) use more (socioeconomic) information to improve these time series. Ultimately, we probably should just use the "best" forecast for all experiments. The problem is that the way we gauge how well a given forecast method does is by cutting out the final six months of data to use for testing. Using an RMSE on this small of a set of data and using that to say which forecast is "best" just feels like mistaking noise for signal. Thus, I'd probably advocate for treating the forecasts themselves as _assumptions_ (and thus varying them in the experiments), in contrast to the model, for which metrics of predictive power are more meaningful.

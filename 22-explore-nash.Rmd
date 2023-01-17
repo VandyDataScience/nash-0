@@ -1,0 +1,516 @@
+---
+title: "22-explore-nash"
+output:
+  html_document:
+    toc : true
+    df_print: paged
+  pdf: default
+  pdf_document: default
+---
+
+
+```{r load, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+
+ ##  Load libs, common functions
+
+
+source(knitr::purl("12-load-nash.rmd"))
+fs::file_delete("12-load-nash.R")
+p_load(ggplot2, Hmisc, data.table, DataExplorer)
+
+#install.packages("data.table")
+#if DataExplorer doesn't work, try reinstalling data.table to latest version
+
+```
+# Nashville Exploratory Data Analysis (EDA)
+
+This data consists of 68,476 Permit applications with 20 attribute columns each. The data spans the period of time of 6/15/2016 to 6/15/2021. It includes permits that are still pending review in addition to permits with final outcomes. As a note, permit numbers beginning with a T or D have yet to be issued, as reflected in the status attribute.
+
+```{r dim, echo = FALSE}
+print(paste("Dataframe Rows:",dim(nash_permits)[1]))
+print(paste("Dataframe Columns:",dim(nash_permits)[2]))
+nash_permits
+nrow_nash = nrow(nash_permits)
+
+```
+
+### Permit Status
+
+With a handful of exceptions, almost all the permit status types fall into one of the following 5 categories:
+
+- Expired
+- Done
+- Issued
+- Cancelled
+- Open
+
+The statuses are broken down by year in Figure 3.
+
+**Be advised** dataframe is modified to change 32 instances of "CNCL" to "CANCELLED"
+
+
+```{r plot_status, echo=FALSE}
+ ## #plot of different permit types and status
+
+# change cncl to cancelled
+
+nash_permits$status[nash_permits$status=="CNCL"]="CANCELLED"
+
+ ## status
+
+status_table = table(nash_permits$status)
+status_tabl_nash_permits = as.data.frame(status_table)
+#status_tabl_nash_permits
+
+status_barplot = ggplot(data=status_tabl_nash_permits, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Figure 1: All Permits by Status Type")
+status_barplot
+
+status_year = nash_permits %>% select(status, date_entered) %>%
+  mutate(year = format(as.Date(date_entered, format= "%m/%d/%Y"),"%Y")) %>%
+  select(-date_entered) %>% group_by(year, status) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(year, status)
+  
+status_year_plot = ggplot(data = status_year, aes( x = status, y = count, fill = year ) ) +    # print bar chart
+  geom_bar( stat = 'identity', position = 'dodge' ) +
+  geom_text(aes(label=count), vjust=-0.3, size=2)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Figure 2: All Permits by Status Type and Year")
+status_year_plot
+
+#make sure to include, compare to other cities
+
+status_year_top = status_year %>% filter(status == "CANCELLED" | status == "EXPIRED" | status == "DONE" | status == "ISSUED" | status == "OPEN")
+
+status_year_plot_top = ggplot(data = status_year_top, aes( x = year, y = count, fill = status ) ) +    # print bar chart
+  geom_bar( stat = 'identity', position = 'dodge' ) +
+  geom_text(aes(label=count), vjust=-0.3, size=3)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  scale_fill_manual("Status", values = c("CANCELLED" = "pink", "DONE" = "light green", "EXPIRED" = "orange", "ISSUED" = "light blue", "OPEN" = "cyan" )) +
+  ggtitle("Figure 3: Permit Status by Year (Top 5 Statuses)")
+status_year_plot_top
+
+
+
+```
+
+### Permit Types
+
+There are 32 different permit types in the Nashville data set. They are quantified both by code and full code description below. Of the 32 types, 9 occur more than 1,000 times over the 5 year study period. These 9 types are also highlighted in the plots below, and also are plotted by year to see how their numbers change over time.
+
+```{r plot_types, echo = FALSE}
+
+
+type_table = table(nash_permits$permit_type)
+
+type_table_nash_permits = as.data.frame(type_table)
+type_table_nash_permits_top = type_table_nash_permits %>% filter(Freq > 1000)
+#type_table_nash_permits_top
+
+type_barplot = ggplot(data=type_table_nash_permits, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90))  +
+  ggtitle("Figure 1: Total Permit Types")
+type_barplot
+
+
+type_barplot_top = ggplot(data=type_table_nash_permits_top, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Figure 2: Total Permit Types (Top 9 Types)")
+type_barplot_top
+
+ ## type but with descriptions
+
+type_table = table(nash_permits$permit_type_description)
+#barplot(type_table)
+
+type_table_nash_permits = as.data.frame(type_table)
+
+type_barplot = ggplot(data=type_table_nash_permits, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90))  +
+  ggtitle("Figure 3: Total Permit Types")
+type_barplot
+
+type_table_nash_permits_top = type_table_nash_permits %>% filter(Freq > 1000)
+#type_table_nash_permits_top
+
+type_barplot_top = ggplot(data=type_table_nash_permits_top, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90))  +
+  ggtitle("Figure 4: Total Permit Types (Top 9 Types)")
+type_barplot_top
+
+type_year = nash_permits %>% select(permit_type_description, date_entered, permit_type) %>%
+  mutate(year = format(as.Date(date_entered, format= "%m/%d/%Y"),"%Y")) %>%
+  select(-date_entered) %>% group_by(year, permit_type_description) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(year, permit_type_description) %>%
+  ungroup %>%
+  filter(permit_type == "CACN" | permit_type == "CACR" | permit_type == "CACT" | permit_type == "CADM" | permit_type == "CARA" | permit_type == "CARN" | permit_type == "CARR" | permit_type == "CASN" | permit_type == "CAUO" )
+#type_year  
+
+type_year_plot = ggplot(data = type_year, aes( x = year, y = count, fill = permit_type_description ) ) +    # print bar chart
+  geom_bar( stat = 'identity', position = 'dodge' ) +
+  geom_text(aes(label=count), vjust=-0.3, size=1.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0)) +
+  ggtitle("Figure 5: Permit Type by Year (Top 9 Types)")
+type_year_plot
+
+
+```
+
+### Issued Demolition Permits
+
+This section creates a subset for demolition permits, or permits marked as "CADM".
+CADM permits are issued for a given time period. At any point during this period, the demolition is completed, generating waste. The permit expires at the end of the given time period.
+Therefore, expired CADM permits are the CADM permits expected to have generated waste.
+
+**Be advised** The dataframe was modified for demolition permits based on feedback from Figure 2 under the following conventions:
+
+- "HOLD" permits are now listed as "CANCELLED" permits
+- "DONE", "ISSUED", and "OK TO PAY" permits are now listed as "EXPIRED" permits
+
+The results of these modifications are available in Figure 3.
+
+```{r Create_Demolition_Subset, echo = FALSE}
+
+nash_permits_demo = nash_permits %>% filter(permit_type == "CADM")
+nash_permits_nondemo = nash_permits %>% filter(permit_type != "CADM")
+nrow_demo = nrow(nash_permits_demo)
+#5,544 rows
+print(paste("The number of demolition permits is", nrow_demo,  "or", 100 * nrow_demo / nrow_nash,"% of", nrow_nash, "total permits"))
+
+demo_ratios <- data.frame(
+  group=c("Demo", "Non-Demo"),
+  value=c(nrow_demo, nrow_nash - nrow_demo))
+
+ggplot(demo_ratios, aes(x="", y=value, fill=group)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0)+
+  ggtitle("Figure 1: Demo Permits vs. All Permits")
+
+#below subset are demo permits that expired and likely created waste
+
+nash_permits_demo_expire = nash_permits %>% filter(status == "EXPIRED") %>% filter(permit_type == "CADM")
+
+nrow_demoexp = nrow(nash_permits_demo_expire)
+
+print(paste("The number of expired demolition permits is", nrow_demoexp, "or", 100 * nrow_demoexp / nrow_demo,"% of", nrow_demo, "total demolition permits"))
+#4,732
+
+#below subset identifies all non-expired demo permits, and their status to explain why not expired
+
+nash_permits_demo_non_expired = nash_permits %>% filter(permit_type == "CADM") %>% filter(status != "EXPIRED")
+nrow_demononexp = nrow(nash_permits_demo_non_expired)
+#812 cases of 5,544 rows
+
+print(paste(nrow_demononexp, "demolition permits are not listed as expired. Their statuses are listed in the barplot below:"))
+
+#table(nash_permits_demo_non_expired$status)
+
+df_demononexp = as.data.frame(table(nash_permits_demo_non_expired$status))
+
+type_barplot = ggplot(data=df_demononexp, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0))  +
+  ggtitle("Figure 2: Non-Expired Demolition Permits by Status")
+type_barplot
+
+#most are cancelled, open, or issued. 19 marked as done in clerical error perhaps?
+
+#FEEDBACK FROM NASHVILLE 
+
+#cancelled, no waste to be generated
+
+#throwout hold
+
+#open is not yet generating waste, applying, coming in next 9 months
+
+#done, issued, ok pay, and expired are one cat, 
+
+nash_permits_demo$status[nash_permits_demo$status == "HOLD"] <- "CANCELLED" 
+nash_permits_demo$status[nash_permits_demo$status == "DONE"] <- "EXPIRED" 
+nash_permits_demo$status[nash_permits_demo$status == "ISSUED"] <- "EXPIRED"
+nash_permits_demo$status[nash_permits_demo$status == "OK TO PAY"] <- "EXPIRED" 
+
+df_demononexp_mod = as.data.frame(table(nash_permits_demo$status))
+
+type_barplot = ggplot(data=df_demononexp_mod, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0))  +
+  ggtitle("Figure 3: All Demolition Permits after consolidating to 3 statuses")
+type_barplot
+
+#introduces changes to Demo statuses only
+
+
+nash_permits_new = bind_rows(nash_permits_nondemo, nash_permits_demo)
+
+
+```
+
+### Missing Data
+
+In short, Nashville's C&D permit data set is by and large complete, with NA's or missing data primarily showing up in instances where they would be expected to be incomplete.
+
+Figure 1:
+An initial look at Nashville's permit data shows that, for the most part, most fields are at least 98% complete with the exception of the following columns:
+
+- Construction Cost (where $0 = NA)
+- Date Issued
+- Final Inspection Date
+- Final Inspection Result
+
+
+Figure 2: A closer investigation reveals that 4 of the 5 primary permit statuses explain the vast majority of the permits with NAs in the Final Inspection column. 
+
+- Expired
+- Issued
+- Cancelled
+- Open
+
+The above permit statuses, generally indicating that a project is incomplete or demolition, are expected to have missing values for columns such as cost and final inspection result.
+
+Figure 3: In this plot, we remove CADM demolition permits from the NA analysis. We only see a slight reduction in NAs in the columns of interest, however. This is likely due to the small population of demolition permits compared to total population of construction permits. The CADM permits are reintroduced to the data set in subsequent analysis below.
+
+Figure 4: As it turns out, after filtering out the half of the data set (approximately 32,000 rows) that is listed as 'cancelled','expired','issued', or 'open', the remaining 'done' / outlier permit statuses report extremely few NAs. In this 'done' subset, the columns of concern now show almost no NAs at all (<4%). The table below Figure 4 clarifies the exact statuses of this largely complete subset.
+
+
+
+```{r missing, echo=FALSE}
+
+
+
+plot_missing(nash_permits, title = "Figure 1: \nNA check for All Permits")
+
+#note missing date issued, final inspections. check if related to project being cancelled
+
+nash_permits_NAcheck = nash_permits %>% filter(is.na(final_insp_date))
+
+NA_table = table(nash_permits_NAcheck$status)
+
+NA_table_df = as.data.frame(NA_table)
+
+NA_barplot = ggplot(NA_table_df, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5)+
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Figure 2:\nPermits with NA in Final \nInspection Column by Type")
+NA_barplot
+
+#
+
+
+nash_permits_select = nash_permits %>% filter(permit_type != "CADM")
+
+plot_missing(nash_permits_select, title = "Figure 3:\nNA check for Permits \nEXCLUDING Demolition Permits")
+
+
+nash_permits_select2 = nash_permits %>% filter(status != "CANCELLED" & status != "EXPIRED" & status != "ISSUED" & status !=  "OPEN")
+
+
+
+plot_missing(nash_permits_select2, title = "Figure 4:\nNA check for Permits \nEXCLUDING Cancelled, Expired, Issued, and Open")
+
+table(nash_permits_select2$status)
+
+
+#### CHECK TO SEE WHAT PART OF NA INSPECTION IS A DEMO TYPE PERMINT, DONT EXPECT FINAL INSP
+
+# CONSIDER TOSSING DONE BC 
+```
+### Major Projects
+
+54.4% of the permits feature an estimated construction value of over $50,000, indicating a larger development which may generate more waste, as depicted by the graph below. This proportion was calculated after removing permits which listed construction value as 0 or NA.
+
+```{r expense_ratios, echo = FALSE}
+#identify number of projects more than 50k
+
+nash_permits_big_projects = nash_permits %>% filter(!is.na(const_cost))
+b = length(nash_permits_big_projects$permit_number)
+
+nash_permits_big_projects = nash_permits_big_projects %>% filter(const_cost >= 50000 )
+
+a = length(nash_permits_big_projects$permit_number)
+
+expensive_permits_ratio = a / b
+expensive_permits_ratio
+
+#54% of total permits
+#34,729 permits
+
+project_ratios <- data.frame(
+  group=c("Over 50k", "Under 50k"),
+  value=c(expensive_permits_ratio,1-expensive_permits_ratio)
+)
+
+ggplot(project_ratios, aes(x="", y=value, fill=group)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0)
+
+```
+
+### Repeat Entries
+
+Among these permits, exactly 379 cases of repeated permit numbers, or 0.05% of the total population. This rarely occurring condition relates to a single project spanning over multiple addresses, for which each address is awarded a duplicate permit, or a project with one address reporting two unique final inspection dates. The permits are viewable in the table below. 
+
+To be clear, there are 0 cases of duplicate rows, despite the 379 duplicate permit numbers. All 379 rows vary either in the address field or the final inspection date field.
+
+The duplicate permits never differ in constr_cost value, suggesting that the each repeated permit reports that total constr_cost value for the project
+
+The most a permit is repeated is 7 times, for a permit to demolish 7 unique units on 1301 PORTER RD. The vast majority of permits (~80%) are only repeated 2 times, however.
+
+Collapsing the permits to only contain the latest final inspection date and address (to capture the final extent of the project) collapses the subset to 209 unique rows
+
+**Be advised** dataframe is modified to collapse duplicate permits into a single entry
+
+```{r repeat_permits, echo = FALSE}
+#identify amount of repeating permit numbers
+
+#68,476
+
+#master permit applications may have multiple, only use master if possible, acronym
+
+###INVESTIGATE put in behavior of repeat permits. Does only address change? Is the value the SAME or unique for each permit? Anything else change
+
+dup_perm = nash_permits %>% group_by(permit_number) %>%
+  mutate(count = n()) %>%
+  arrange(permit_number, final_insp_date) %>%
+  filter(count != 1) 
+
+dup_perm_view = dup_perm %>% select(permit_number, count, const_cost, address, final_insp_date, permit_type_description, purpose)
+dup_perm_view
+
+#checks for entirely duplicate rows, there are none
+dup_perm_no_exact_copies = dup_perm %>% distinct()
+#nrow(dup_perm_no_exact_copies)
+
+x = nrow(nash_permits)
+
+y = nrow(dup_perm)
+
+repeated_permits = y
+#repeated_permits
+
+repeated_permits_ratio = y/x
+#repeated_permits_ratio
+
+##### COLLAPSE SECTION
+
+#collapse each permit duplicate to just one instance by using only the last (or latest) row
+
+dup_perm = dup_perm %>%
+  group_by(permit_number) %>%
+  slice(-1)
+#dup_perm
+
+nash_permits_collapsed_duplicates = nash_permits %>%
+  group_by(permit_number) %>%
+  mutate(count = n()) %>%
+  filter(count == 1) 
+#68,097 this correctly takes out all 379 repeats
+
+#
+
+nash_permits_collapsed_duplicates = bind_rows(nash_permits_collapsed_duplicates, dup_perm)
+
+nash_permits = nash_permits_collapsed_duplicates
+#68,306 this correctly adds back just the 209 collapsed permits
+
+#68,476
+
+
+
+  
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r map, echo = FALSE}
+
+ ## visualize Nashville
+
+## map already exists at https://data.nashville.gov/Licenses-Permits/Building-Permits-Issued-Map-/dmrx-ey8e
+
+## can add this feature later if needed
+
+
+# rolling data set issue (doesnt include 5 years) use map online for inspiration
+# types of permit, demo especially
+
+```
+
+## Appendix of Columns and Categorical Values
+
+```{r appendix, echo = FALSE}
+
+print("All Column Names:")
+
+colnames(nash_permits)
+
+print("All permit_type values:")
+
+unique(nash_permits$permit_type)
+
+print("All permit_type_description values:")
+
+unique(nash_permits$permit_type_description)
+
+print("All permit_sub_type values")
+
+unique(nash_permits$permit_sub_type)
+
+print("All permit_subtype_description values")
+
+unique(nash_permits$permit_subtype_description)
+
+print("All final_insp_result values")
+
+unique(nash_permits$final_insp_result)
+
+print("All status values")
+
+unique(nash_permits$status)
+
+print("All city values")
+
+unique(nash_permits$city)
+
+print("All state values")
+
+unique(nash_permits$state)
+
+```

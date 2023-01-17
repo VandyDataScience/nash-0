@@ -1,0 +1,215 @@
+---
+title: "33-sanfran-features.Rmd"
+output: html_notebook
+---
+
+```{r setup 33}
+source(knitr::purl("13-load-sanfran.Rmd"))
+fs::file_delete("13-load-sanfran.R")
+```
+
+# Handling repeat permits
+
+There are many repeat permit entries, and they occur for many reasons. We'll start here by attempting to re-map this dataset to match Nashville. In doing so, we may find that some of our columns aren't needed. Dropping them may simplify the handling of repeat permit entries.
+
+Going to start with a very simple assumption. Many permits have both a filed and issued status. What seems to happen is that the permit is filed, then gets an updated entry when it is issued. Some fields can change when the permit becomes issued. I'm going to not worry about that and just consider the issued version to be the updated one which we'll use.
+
+(**NOTE -- In order to both show the results of each step of the cleaning process and to be able to apply these steps all at once, I make a single use function here:**)
+
+```{r keep updated permits}
+keep_updated_permits <- function(df, by){
+  df %>% 
+    group_by({{by}}) %>% 
+    mutate(mean_status=mean(issued)) %>% # values greater than 0 indicate at least one issued status
+    ungroup() %>% 
+    filter(!(mean_status>0 & !issued)) %>%  # if there is an issued and a filed, drop the filed
+    select(!c(mean_status))
+}
+```
+
+To use the above function, I need to create integer boolean called issued (TRUE when status=="ISSUED").
+
+```{r trim outdated filed}
+sanfran_permits %>% 
+  mutate(issued=status=="ISSUED") %>% 
+  keep_updated_permits(application_number)
+```
+
+This step alone gets rid of 200K entries, leaving us with about 21K repeats. Instead of trying to assess each case individually, I think we should just make some reasonable aggregation decisions. If these decisions are wrong in a few cases, we're only contaminating a small fraction of the data. We'll make use of the function below.
+
+A wrapper to a call of a summary stat (e.g., min, max, etc.). Returns NA if array `x` consists of all NAs. Otherwise behaves normally.
+(This should probably be placed in a separate notebook, but I'll keep it here for now.)
+
+```{r custom summary stats}
+custom_stat <- function(x, stat, na.rm=TRUE){
+  if(all(is.na(x))){
+    return(NA)
+  }
+  else{
+    return(stat(x, na.rm=na.rm))
+  }
+}
+```
+
+Here we perform the above steps, as well as a final cleaning of remaining columns. The first step is to keep only "issued" permits when "issued" and "filed" exist. The second step is to select the most recent entry (based on `status_date`). All the remaining steps then are applied after we've taken these steps. In general, we take the max of remaining columns and the first non-NA entry for character columns. This could be revisited in the future.
+
+```{r final permit cleaning}
+sanfran_permits_cleaned <- sanfran_permits %>% 
+  mutate(issued=status=="ISSUED") %>% 
+  keep_updated_permits(application_number) %>%                            
+  select(!issued) %>% 
+  group_by(application_number) %>%
+  mutate(latest_status = status_date==custom_stat(status_date, max)) %>%  # is this status_date the most recent status_date
+  filter(latest_status) %>%                                               # drop permits with old status dates
+  select(!latest_status) %>% 
+  mutate(across(where(is.numeric), ~custom_stat(., max))) %>%
+  mutate(across(where(is.POSIXct), ~custom_stat(., max))) %>%
+  mutate(across(where(is.character), ~na.omit(.)[1])) %>% 
+  ungroup() %>% 
+  unique()
+```
+
+
+```{r write to file}
+sanfran_permits_cleaned %>%
+  write_feather(expand_boxpath("San Fran, CA/sanfran_permits_cleaned.feather"))
+```
+
+
+# Prep permits for first model
+
+I'm matching Austin here. Nashville has a few categories which I cannot create. We need permit_number, const_cost, date_issued, comm_v_res, and project_type. Some notes:
+
+* I've updated this to be a function so that it can be applied to both permits and Green Halo.
+
+* I'm temporarily deciding that estimated and not revised cost is the thing to use. It's not clear though when the cost is revised. My concern would be that the revision occurs once the project is underway.
+
+* I am recoding the DBI forms based on https://sf.gov/learn-about-our-building-permit-review-processes
+
+* After some discussion with Allie and comparison with Nashville, we decided on the categories of `proposed_use`/`existing_use` that should be considered residential. These are passed with the argument `residential`
+
+* I noticed in Green Halo, about 25% of the entries have an NA value for `proposed_use`, while only about 2% have an NA value for `existing_use`. The plan will be to use `proposed_use` when available to get a value of `comm_v_res` and otherwise use `existing_use`.
+
+
+```{r first model function}
+prep_for_first_model <- function(df, residential){
+  df %>% 
+    rename(const_cost = estimated_cost,
+           date_issued = status_date) %>% 
+    mutate(project_type = as.character(form_number)) %>% 
+    mutate(project_type = recode(project_type,
+                               "1" = "construction",
+                               "2" = "construction",
+                               "3" = "construction",
+                               "4" = "sign",
+                               "5" = "demolition",
+                               "6" = "demolition",
+                               "7" = "sign",
+                               "8" = "construction")) %>% # 3 and 8 are actually alterations
+    filter(project_type!="sign") %>% 
+    mutate(across(c(existing_use, proposed_use), ~str_to_lower(.))) %>% 
+    mutate(across(c(existing_use, proposed_use), ~na_if(., "not applicable"))) %>%
+    mutate(comm_v_res = if_else(is.na(proposed_use), existing_use, proposed_use)) %>% # preference for proposed_use
+    mutate(comm_v_res = case_when(comm_v_res %in% residential ~ "residential",
+                                  is.na(comm_v_res) ~ NA_character_,
+                                  TRUE ~ "commercial")) %>% 
+    select(permit_number, const_cost, date_issued, comm_v_res, project_type)
+}
+```
+
+Here are the categories which are to be considered residential:
+
+```{r define residential categories}
+residential <- c("1 family dwelling", "apartments", "prkng garage/private", 
+                 "2 family dwelling", "residential hotel", "misc group residns.", 
+                 "workshop residential", "storage shed", "swimming pool", 
+                 "artist live/work", "accessory cottage")
+```
+
+Prep permits for first model and output to feather. We have to rename `application_number` first. We're useing `existing_use` to generate `comm_v_res` as described above.
+
+```{r first model permits}
+sanfran_permits_first_model <- sanfran_permits_cleaned %>% 
+  rename(permit_number = application_number) %>% 
+  prep_for_first_model(residential)
+
+sanfran_permits_first_model %>%
+  write_feather(expand_boxpath("San Fran, CA/ready_for_first_model.feather"))
+```
+
+
+For good measure, here I show all the categories which were labeled as "residential" above.
+```{r showing residential options}
+unique_cats <- unique(str_to_lower(sanfran_permits_cleaned$existing_use))
+unique_cats[unique_cats%in%residential] <- str_c("#R - ", unique_cats[unique_cats%in%residential])
+str_replace(sort(unique_cats), "#", "")
+```
+
+
+# Green Halo
+
+## Permit cleanup
+
+In 23-2, we identified the GH permits with odd entries. These were the ones we found:
+
+```{r odd permits}
+permit_length <- nchar("202008242510")
+
+sanfran_tonnage %>% 
+  filter( !startsWith(permit_number,"20") | nchar(permit_number)!=permit_length) %>% 
+  select(permit_number, everything())
+```
+
+We discovered that the only entries with matches (either by permit or address) in the permits dataset were the one at 300 Clay and the one at 1600 Owens. The former (Clay) has two permits associated with it, while the latter (Owens) only has one valid permit ID (the first one). I fix the permits in a hacky way, join with the permits set, and aggregate the Clay St. entries.
+
+```{r join and clean permits and gh}
+pstr <- "2nd Fl: 2019.1121.7868 & Fl34: 2019.1120.7806"
+
+# Get just Clay street entry and change permit to be one correct permit
+sf_clay <- sanfran_tonnage %>% 
+  filter(permit_number==pstr) %>% 
+  mutate(permit_number="201911217868")
+
+sanfran_joined <- sanfran_tonnage %>% 
+  rbind(sf_clay) %>%    # create duplicated row with one correct Clay St. permit number
+  mutate(permit_number = if_else(permit_number==pstr, "201911207806", permit_number)) %>%   # get other correct Clay permit no.
+  mutate(permit_number = gsub(",.*","",permit_number)) %>%   # extracts first permit no. for Owens St.
+  mutate(permit_number = str_remove_all(permit_number,"[asb]")) %>%   # remove letters so numeric conversion succeeds
+  mutate(permit_number = as.numeric(permit_number)) %>% 
+  rename(status_gh = status) %>% 
+  left_join(sanfran_permits_cleaned, by=c("permit_number"="application_number")) %>% 
+  group_by(gh_tracking_number) %>%                              # fix Clay St. entry. All steps below only apply to this permit
+  mutate(description = paste0(description, collapse=" ")) %>%   # combine descriptions
+  mutate(across(c(estimated_cost, revised_cost), ~custom_stat(., sum))) %>%       # add costs
+  mutate(across(contains("date"), ~custom_stat(., max))) %>%                      # latest dates
+  mutate(across(where(is.numeric), ~custom_stat(., max))) %>%   # max for anything else numeric
+  mutate(permit_number = permit_number[1]) %>%                  # choose just one permit num
+  ungroup() %>% 
+  unique()
+```
+
+
+```{r write full modeling data for cleaned permits and GH data}
+sanfran_joined %>%
+  write_feather(expand_boxpath("San Fran, CA/full_tonnage_permit.feather"))
+```
+
+
+Last let's get this in the same format as the above permits set (but also include tonnage) and write to feather. (This step removes most of the columns, but the sanfran_joined set remains here so that we can repurpose it.)
+
+```{r first model tonnage}
+sanfran_tonnage_first_model <- sanfran_joined %>% 
+  prep_for_first_model(residential) %>% 
+  left_join(sanfran_joined, by="permit_number") %>% 
+  rename(tonnage = total,
+         project_type = project_type.x) %>% 
+  select(permit_number, const_cost, date_issued, comm_v_res, project_type, tonnage)
+
+```
+
+
+```{r write tonnage first model, purl=FALSE}
+sanfran_tonnage_first_model %>% 
+  write_feather(expand_boxpath("San Fran, CA/tonnage_for_first_model.feather"))
+```
+

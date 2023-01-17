@@ -1,0 +1,375 @@
+---
+title: "44-2-tonnage-experiments.Rmd"
+output: html_notebook
+---
+
+This is a standalone notebook, unlike most of the rest in the `40`-series.
+
+In `44-1`, even the best models we train have an RMSE (MAE) of about 83K (66K) tons when tested on historical Nashville data. Further, our pipeline as currently implemented is not forecasting any long-term increase in the debris produced per year by these projects. There are a lot of possible reasons why these models are generally failing, but it's likely just that we simply do not have (and cannot acquire) enough permit-level features to make accurate predictions in the way we desire. Furthermore, our train-test paradigm established in `43` and `44-1` may not be adequate for probing the model.
+
+In this notebook, we're going to do something simpler. We're going to set up a "baseline model" where we just make forecasts from historical values of debris vs. time. My initial exploration (not included anywhere) suggests that this model has smaller errors and should be what we use moving forward for our "main" forecast in the Shiny app.
+
+```{r load libs}
+library(readxl)
+library(tidyverse)
+library(yardstick)
+library(feather)
+```
+
+
+```{r read in data}
+nashville <- read_excel("nash-zero-shiny/shiny-data/historical_debris_permits_nash.xlsx") %>% 
+    mutate(total_debris = recycling+landfill)
+
+nashville
+```
+# EDA
+
+As it turns out, fitting a line to this data can be decently complicated. What's particularly complicated is the correct characterization of the uncertainty and how that plays into the fit. As such, I'm going to begin with some EDA which attempts to explore some options and justify the final conclusions.
+
+Let's start with a simple view of debris vs cy, along with some simple fits.
+
+```{r two fits}
+nashville %>% 
+  ggplot(aes(x = cy, y = total_debris)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color="red")+
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), color="blue", show.legend=TRUE,se = FALSE) +
+  theme_bw()
+```
+
+Both of these generally look okay, but the second-order looks better to my eye. It's hard to differentiate from this plot alone. It's notable that there's a pretty substantial uptick around about 2016. If we'd done this in 2016, the first-order fit would be tilted down a great deal. 
+
+We may want to consider 2020 as an outlier because it was somewhat extreme with both Covid and the tornado. Here are the fits with that point excluded:
+
+```{r fit no 2020}
+nashville %>% 
+  filter(cy!=2020) %>% 
+  ggplot(aes(x = cy, y = total_debris)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color="red")+
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), color="blue", show.legend=TRUE,se = FALSE) +
+  theme_bw()
+```
+
+We can place confidence intervals on these fits. To display this, I'm going to plot them separately below. Let's exclude 2020 for this figure:
+
+```{r fit with CIs}
+nashville %>% 
+  filter(cy!=2020) %>% 
+  ggplot(aes(x = cy, y = total_debris)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color="red")+
+  theme_bw()
+
+nashville %>% 
+  filter(cy!=2020) %>% 
+  ggplot(aes(x = cy, y = total_debris)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), color="blue", se = TRUE) +
+  theme_bw()
+```
+
+Let's first clarify the difference between what the CI's are showing and what I intuitively wanted them to show. What they are showing here is a 95% confidence interval in the fit at a given value of `cy`. What they are not showing is the scatter in `total_debris` for a given `cy` due to the fact that each calendar year represents a sort of random realization of some underlying model. For example, if you were to make a prediction at CY 2016, you should not express the uncertainty in that prediction with the above CI. The uncertainty should be much broader, as is clear from the fact that, in both plots above, significantly more than 5% of points fall outside the shaded region. Thus, the shaded region can be thought of more as an "error" on the fitted line, given the small sample size.
+
+So, how should we express the uncertainty such that it's showing what we want it to show (i.e., the range of possible outcomes)? That's the next question to explore. To do so, we're going to make some simple predictions. Let's just use the second-order polynomial for this part, which, to me, looks better. We're also going to exclude 2020.
+
+```{r poly fit}
+train <- nashville %>% 
+  filter(cy!=2020)
+
+# model <- lm(train$total_debris ~ poly(train$cy, 2))
+model <- lm(total_debris ~ poly(cy, 2), data=train)
+predictions <- as_tibble(predict(model, train, interval="confidence", level=0.95)) %>% 
+  bind_cols(train) %>% 
+  select(cy,total_debris,fit,everything())
+predictions
+```
+
+Let's first make the same plot as above, just to express the same point as before, i.e., that these confidence intervals are not describing the variance in the data.
+
+```{r recreated CIs plot}
+predictions %>% 
+  ggplot(aes(x = cy)) +
+  geom_point(aes(y=total_debris,color="red"),show.legend=FALSE) +
+  geom_line(aes(y=fit)) +
+  geom_ribbon(aes(ymax=upr, ymin=lwr), fill="grey", alpha=.5)+
+  theme_bw()
+```
+
+First, we can see that this is overconfident (and the same plot as above), with 6/15 points (40%) outside the 95% confidence interval. Again, that's not an issue so much, as this isn't what the CI is meant to express.
+
+Let's start by looking at RMSE. If the above errors are Gaussian and have constant variance with cy, and if we have an unbiased estimator, then MSE is the same as variance. Thus, two RMSE's would represent the CI we're looking for (95%).
+
+```{r rmse}
+rmse_val <- predictions %>% 
+  rmse(truth=total_debris,estimate=fit) %>% 
+  select(.estimate)
+
+predictions %>% 
+  ggplot(aes(x = cy)) +
+  geom_point(aes(y=total_debris, color='r'), show.legend = FALSE) +
+  geom_line(aes(y=fit)) +
+  geom_ribbon(aes(ymax=fit+2*rmse_val$.estimate, ymin=fit-2*rmse_val$.estimate), fill="grey", alpha=.5)+
+  theme_bw()
+```
+
+This looks pretty good overall. Only 1/15 points (7%) are outside of the 95% CI. This is certainly a usable estimate. Still, intuitively, I feel that the uncertainties should be increasing as we increase the predicted value of `total_debris`. Given our underlying model, we shouldn't expect the same uncertainty for a prediction of 100K tons as we would for 1 million tons. To me, what should be constant is the percent error. Instead of doing the above, we could find a mean percent error and apply it to each prediction to get an uncertainty band. Unfortunately, yardstick's metrics aren't giving me what I want, so I'm going to reinvent the wheel.
+
+I should clarify a bit more. I suppose what I want would be called the root mean square percentage error. So you find the percent error in each estimate, square all of those, take the mean, and then take the square root.
+
+```{r rmspe}
+rmspe <- function(truth, estimate){
+  # choosing to divide by estimate because it comes from the model
+  perc_diff <- (truth-estimate)/estimate
+  
+  return(sqrt(mean(perc_diff**2)))
+}
+
+rmspe_val <- rmspe(predictions$total_debris, predictions$fit)
+rmspe_val
+```
+
+```{r plot with rmspe applied}
+predictions %>% 
+  ggplot(aes(x = cy)) +
+  geom_point(aes(y=total_debris, color='r'), show.legend=FALSE) +
+  geom_line(aes(y=fit)) +
+  geom_ribbon(aes(ymax=fit*(1+2*rmspe_val), ymin=fit*(1-2*rmspe_val)), fill="grey", alpha=.5)+
+  theme_bw()
+```
+
+We get the same sort of result here (one point just outside CI, one point on edge), but now the uncertainty is growing as we increase the value of `total_debris`. Both visually and intuitively, I feel better about this characterization overall. If we were to indiscriminately apply the RMSE to characterize the uncertainty in future projections, then we'd likely be overstating our confidence.
+
+Let's do a bit more exploration. The assumption in translating the RMSE to a CI is that the distribution of errors is Gaussian, with sd equal to the RMSE. We can visually check this below (not doing any strict tests of Gaussianity because we have so few points).
+
+```{r error hist}
+err_vec <- predictions$total_debris - predictions$fit
+hist(err_vec)
+```
+
+Just visually, this looks pretty non-Gaussian. Let's compare it to the percent errors.
+
+```{r perc error hist}
+perc_err_vec <- (predictions$total_debris-predictions$fit)/predictions$fit
+hist(perc_err_vec)
+```
+
+This looks much more like what we want. There's no real guarantee that treating the uncertainties the way I have is the right thing to do, but it just seems very obvious to me that it is. It's worth noting that, when fitting the polynomial, I believe the assumption is constant variance in y with x. I'm stating here that this assumption is wrong. It would be good if we could explicitly change this assumption, but it probably doesn't affect the fit significantly. I'm okay with this inconsistency.
+
+
+
+
+
+
+
+
+# Testing the fit
+
+The best thing to do here is to fit to the first N years and test on the remaining years. We can check this for a couple different values of N, for including 2020 vs. not, and for linear vs. second order polynomial vs. exponential. Let's write a function to do all of this.
+
+```{r fit function}
+test_fit <- function(df, final_train_yr = 2016, fit_type = "p", exc_final=TRUE){
+  #' test_fit
+  #'
+  #' @param df Nashville historical dataframe
+  #' @param final_train_yr final year to be included in training set
+  #' @param fit_type l - linear, p - 2nd order poly, e - exponential
+  #' @param exc_final Exclude year 2020 in train/test (bool)
+  #'
+  #' @return named list with training/testing sets and errors (rmpse)
+  
+  # make copy
+  df_mod <- tibble(df)
+  
+  # drop 2020
+  if(exc_final){
+    df_mod <- df_mod %>% 
+      filter(cy!=2020)
+  }
+  
+  # train, test
+  train <- df_mod %>% 
+    filter(cy<=final_train_yr)
+  test <- df_mod %>% 
+    filter(cy>final_train_yr)
+  
+  if(fit_type=="p"){
+    model <- lm(total_debris ~ poly(cy, 2), data=train)
+  }
+  else if(fit_type=="l"){
+    model <- lm(total_debris ~ cy, data=train)
+  }
+  else if(fit_type=="e"){
+    model <- lm(log(total_debris) ~ cy, data=train)
+  }
+  else{
+    stop("Unrecognized fit_type.")
+  }
+  
+  train_pred <- as.tibble(predict(model, train, interval=c("prediction"))) %>% 
+    bind_cols(train) %>% 
+    select(cy, total_debris, fit, everything())
+  
+  test_pred <- as.tibble(predict(model, test, interval=c("prediction"))) %>% 
+    bind_cols(test) %>% 
+    select(cy, total_debris, fit, everything())
+  
+  if(fit_type=="e"){
+    train_pred <- train_pred %>% 
+      mutate(fit = exp(fit))
+    test_pred <- test_pred %>% 
+      mutate(fit = exp(fit))
+  }
+  
+  train_rmspe <- rmspe(train_pred$total_debris, train_pred$fit)
+  test_rmspe <- rmspe(test_pred$total_debris, test_pred$fit)
+  
+  return(list("train" = train_pred, "test" = test_pred, "train_rmspe" = train_rmspe, "test_rmspe" = test_rmspe))
+}
+```
+
+Let's also make a function to plot the fits, both training and testing.
+
+```{r, plot fit tests}
+plot_results <- function(results){
+  train_perr <- results$train_rmspe
+  test_perr <- results$test_rmspe
+  p <-ggplot() +
+    geom_point(data = results$train, aes(x = cy, y=total_debris, color='r'), show.legend=FALSE) +
+    geom_line(data = results$train,aes(x=cy, y=fit)) +
+    geom_ribbon(data = results$train, aes(x = cy, ymax=fit*(1+2*train_perr), ymin=fit*(1-2*train_perr)), fill="grey", alpha=.5) +
+    geom_point(data = results$test, aes(x = cy, y=total_debris, color='r'), show.legend=FALSE) +
+    geom_line(data = results$test, aes(x=cy, y=fit)) +
+    geom_ribbon(data = results$test, aes(x = cy, ymax=fit*(1+2*train_perr), ymin=fit*(1-2*train_perr)), fill="grey", alpha=.5) +
+    theme_bw()
+    
+  return(p)
+}
+```
+
+Below we perform first order fits. We'll use different combos of which years fall in the training vs testing set. Because we're forecasting into the future, we're always going to split testing and training temporally. The idea is to test how a model would have performed if fed the data at any given year. We're going to save the training/testing error for different types of fits and compare below. I'm excluding 2020 in these fits.
+
+```{r, linear tests}
+l_train_err <- c()
+l_test_err <- c()
+
+for(yr in seq(2010, 2017)){
+  results <- test_fit(nashville, final_train_yr = yr, fit_type="l",exc_final = TRUE)
+  l_train_err <- c(l_train_err, results$train_rmspe)
+  l_test_err <- c(l_test_err, results$test_rmspe)
+  show(plot_results(results))
+}
+```
+
+I should clarify what's being plotted above a bit more. The red points are the real data. The left chunk contains the data we're fitting to and the right contains what we're trying to predict. The shaded region is the 95% confidence interval which comes from assuming a constant root-mean-square percent error (rmspe), as discussed above. For the right chunk of points (the test set), the shaded region is estimated from on the RMSPE of the TRAIN set, NOT what we calculate from the RMSPE of the TEST set. In other words, it's the 95% confidence interval of our predictions.
+
+Overall, the linear fits look pretty good. However, it does look as though the future isn't well predicted when we start including years 2013-2015 in the training set. Now, let's check a second order polynomial.
+
+```{r, second order poly test}
+p_train_err <- c()
+p_test_err <- c()
+
+for(yr in seq(2010, 2017)){
+  results <- test_fit(nashville, final_train_yr = yr, fit_type="p",exc_final = TRUE)
+  p_train_err <- c(p_train_err, results$train_rmspe)
+  p_test_err <- c(p_test_err, results$test_rmspe)
+  show(plot_results(results))
+}
+```
+
+The results here are interesting. There's a strong overprediction when there are only six data points in the training. Then we see some good characterization, followed by the polynomial turning over (which seems to clearly not be the behavior we expect and results in poor predictions). Then this is followed by what looks like good predictions once 2016 is included.
+
+Last we're going to check fitting an exponential. What we're actually doing is fitting `log(total_debris) ~ cy`. This is done in the `test_fit` function. Despite that being the form of the fit, we're going to express the errors in `total_debris`, not in `log(total_debris)`.
+
+```{r, exponential fit}
+e_train_err <- c()
+e_test_err <- c()
+
+for(yr in seq(2010, 2017)){
+  results <- test_fit(nashville, final_train_yr = yr, fit_type="e",exc_final = TRUE)
+  e_train_err <- c(e_train_err, results$train_rmspe)
+  e_test_err <- c(e_test_err, results$test_rmspe)
+  show(plot_results(results))
+}
+```
+
+Just visually, it seems abundantly clear that this fit is doing a better job compared to linear or second order, no matter how many points are in the training/testing sets. We're of course limited by the small number of data points we have here, but the ability of this fit to properly characterize the trend and uncertainty seems superior when compared to the previous cases.
+
+We can investigate this more by looking at the rmspe of both the training and testing sets as we vary the number of data points in the training (and thus also in the testing) sets.
+
+```{r, rmspe comparison}
+ntrain <- seq(6,13)
+
+plot(ntrain, p_test_err, col="red", type="l", ylab="rmspe", lty=1, xlim = c(6, 13), ylim = c(0,0.7))
+lines(ntrain, p_train_err, col="red", type="l", ylab="rmspe", lty=2)
+lines(ntrain, l_test_err, col="blue", type="l", ylab="rmspe", lty=1)
+lines(ntrain, l_train_err, col="blue", type="l", ylab="rmspe", lty=2)
+lines(ntrain, e_test_err, col="green", type="l", ylab="rmspe", lty=1)
+lines(ntrain, e_train_err, col="green", type="l", ylab="rmspe", lty=2)
+legend(11,0.7,legend=c("linear","poly","exponential","train","test"), 
+       col=c("blue","red","green","black","black"),
+       lty=c(1,1,1,2,1), ncol=1)
+```
+
+We can see that regardless of how many points are in the training set, the exponential has the best test error. The training error is comparable for all three lines.
+
+
+
+
+
+# Building datasets for shiny
+
+With our exponential growth model, we're now going to fit to all the data (excluding 2020) and write a feather file to be used in the shiny app. This file will contain the historical data and the fit values. Notably, we're predicting on historical calendar years, but our future estimates will be for fiscal years. This is straightforward -- we offset the fiscal years from calendar years by 0.5. Thus FY22 corresponds to cy 2021.5.
+
+```{r final fit}
+# Set up training set and fit model
+train <- nashville %>% filter(cy!=2020)
+model <- lm(log(total_debris) ~ cy, data=train)
+
+# Get fit for training set
+train_pred <- as.tibble(predict(model, train, interval=c("prediction"))) %>% 
+  bind_cols(train) %>% 
+  mutate(fit = exp(fit))
+
+# Calculate rmspe from training set
+rmspe_final <- rmspe(train_pred$total_debris, train_pred$fit)
+
+# Now make final Nashville tibble where we'll put all predictions
+nash_final <- as.tibble(predict(model, nashville, interval = c("prediction"))) %>% 
+  bind_cols(nashville)
+
+# Get future five years of prediction -- We want fy so we have to offset by 0.5 years
+pred_set <- tibble("cy" = seq(2021, 2025)+0.5)
+
+nash_future <- as.tibble(predict(model, pred_set, interval=c("prediction"))) %>% 
+  bind_cols(pred_set)
+
+# combine historical fit and future predictions and construct final df we want
+nash_final <- nash_final %>% 
+  bind_rows(nash_future) %>% 
+  mutate(fit = exp(fit)) %>% 
+  select(cy, total_debris, fit, recycling) %>% 
+  mutate(rmspe = rmspe_val) %>% 
+  mutate(sd = fit*rmspe_val) %>% 
+  mutate(lwr = fit-2*sd, upr = fit+2*sd) %>% 
+  mutate(year_type = if_else(cy<2021, "CY","FY")) %>% 
+  mutate(year_label = str_c(year_type, substr(as.character(ceiling(cy)),3,4))) %>% 
+  select(!year_type)
+
+nash_final %>% write_feather("nash-zero-shiny/shiny-data/debris_projections.feather")
+```
+
+Plotting the final predictions below. We can see the effect of excluding 2020 in the fit, due to Covid and the tornado.
+
+```{r, plot final predictions}
+nash_final %>% 
+  ggplot(mapping = aes(x = cy)) +
+    geom_point(aes(y=total_debris, color='r'), show.legend=FALSE) +
+    geom_line(aes(x=cy, y=fit)) +
+    geom_ribbon(aes(ymin = lwr, ymax = upr), fill="grey", alpha=.5) +
+    theme_bw()
+```
+
+
+

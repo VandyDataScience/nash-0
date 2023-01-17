@@ -1,0 +1,318 @@
+---
+title: "35-cities-lookup"
+output:
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    number_sections: true
+---
+
+# Overview and Usage
+This file uses the Box `/nash-zero/city_variable_crosswalk.xlsx` file to attempt to standardize the names and levels of columns across datasets.  A function for generating this dataset, encopassing all the steps below can be found in 30.  Each row of any individual city data contains a column called `city_name`, and thus the data can be re-separated into individual city tibbles.
+
+Since all of the names of the columns are the same and the levels of certain columns the same, this resultant dataframe can then have future functions applied uniformly.
+
+# Preliminaries of loading and fixing cleaned permit data
+## Load preliminaries
+```{r load libraries and source}
+source(knitr::purl("30-feature-engineering.Rmd", quiet=TRUE))
+fs::file_delete("30-feature-engineering.R")
+```
+
+## Austin
+```{r read austin, eval=FALSE, purl=FALSE}
+#read austin data
+austin_permits <- read_feather(expand_boxpath("Austin, TX/austin_permits.feather"))
+res_demo_permits <- read_feather(expand_boxpath("Austin, TX/austin_res_demo_permits.feather"))
+```
+
+### Implementing 31-austin-features cleaning
+Following the code instructions of 31-austin-cleaning; cannot source file directly (as is appropriate)
+```{r get austin base with final cleaning steps, eval=FALSE, purl=FALSE}
+
+#get total valuation across all permits with same base number and take the most recent issue date
+aust_perm_clean <- austin_permits %>%
+  group_by(permit_num_clean) %>%
+  mutate(total_valuation = sum(total_valuation)) %>%
+  arrange(desc(issued_date)) %>%
+  slice(1) %>%
+  ungroup()
+```
+
+## Nashville
+```{r read nash, eval=FALSE, purl=FALSE}
+nash_permits <- read_feather(expand_boxpath("Nashville/nash_permits.feather"))
+```
+
+### San Francisco
+```{r read sanfran, eval=FALSE, purl=FALSE}
+sanfran_full <- read_feather(expand_boxpath("San Fran, CA/full_tonnage_permit.feather"))
+```
+
+
+### Unit test of vectorized read
+Note that the following unit tests will depend upon this one to have been run.  The function for the vectorized read can be found in 30.
+```{r read unit test, purl=FALSE}
+#set city list
+city_list <- c('nashville', 'austin', 'san_francisco')
+
+#load cities
+city_dfs <- city_list %>%
+  load_city_data()
+  
+```
+
+# Using the variable cross-walk for standardizing names of columns
+Here we'll just take a second and look at what things will look like when we load the crosswalk and how we can use them.  We'll choose to work on SF.
+```{r read crosswalk, purl=FALSE}
+#identify sheets
+cw_fname <- expand_boxpath('city_variable_crosswalk.xlsx')
+sheets <- excel_sheets(cw_fname)
+
+#load and clean names of read data sheets
+cw_dfs <- sheets %>%
+  map(~read_excel(cw_fname, sheet=.)) %>%
+  map(clean_names) %>%
+  set_names(sheets)
+
+#fix this sheet to whittle down info
+cw_dfs$columns_conversion <- cw_dfs$columns_conversion %>%
+  filter(keep_in_ds ==1 | use_in_model==1) %>%
+  select(-contains('notes'))
+
+#do a little post-processing
+city_dfs <- city_dfs %>%
+  modify_at(.at='san_francisco', san_francisco_pre, cw_dfs)
+
+```
+
+Now, I just want to figure out the nuances of what the function needs to contain so I'll try this out on San Francisco:
+```{r check out renaming sf, eval=FALSE, purl=FALSE}
+
+#remove undefined rows for sf, remove is_calc rows, get 2 columns of interest to create named list
+sf_rename <- data_mdl_df %>%
+  drop_na(san_francisco) %>%
+  select(final_column_name, san_francisco) %>%
+  deframe()
+
+#look at our dictionary - it looks right
+sf_rename
+
+#do the renaming
+sf_fixed_names <- sanfran_permits %>%
+  rename(!!!sf_rename)
+
+#looks good!
+sf_fixed_names
+
+```
+The deframe function was helpful here, as it allows for the conversion between 2-column dataframes and a named vector.  That's just what we wanted, because the named vector can act as a lookup table or dictionary itself!  However, here we just use it for direct recoding.
+
+Now let's create the function.  The details of this function, `basic_col_rename`, can be found in 30.
+
+### Unit tests: column renaming
+```{r renaming unit tests, purl=FALSE}
+column_status_dfs <- city_dfs %>%
+  imap( ~basic_col_rename(.x, lookup_df=cw_dfs, city_name=.y)) %>%
+  map(~select(.x, status, everything()))
+
+## Column rename helpers
+get_renames <- function(lookup_dfs, city_name){
+   
+  all_cols <- lookup_dfs$columns_conversion %>%
+    drop_na(!!city_name) %>%
+    #filter(is.na(pre_calc)) %>%
+    select(!!city_name, final_column_name)
+  
+  #get columns that were renamed
+  rn_cols <- all_cols %>%
+    filter(final_column_name != !!city_name) %>%
+    pull(final_column_name)
+  
+  ordered_cols <- deframe(all_cols) %>%
+    imap(c) %>%
+    unlist() %>%
+    unique()
+  
+  return(list(to_rename = rn_cols,
+              corr_rename = ordered_cols))
+}
+
+  # Get renamed columns and columns side by side to make sure they match and exist
+column_status_dfs %>%
+  imap(~select(.x, all_of(get_renames(cw_dfs, .y)$corr_rename)))
+
+#get unique values of renames for character variables
+map(get_renames(cw_dfs, 'nashville')$to_rename, ~unique(column_status_dfs$nashville[[.]])[1:50])
+map(get_renames(cw_dfs, 'austin')$to_rename, ~unique(column_status_dfs$austin[[.]])[1:50])
+map(get_renames(cw_dfs, 'san_francisco')$to_rename, ~unique(column_status_dfs$san_francisco[[.]])[1:50])
+```
+
+
+## Basic levels rename (recode) function
+This function looks super similar to the column rename, except now, we want to extract rows based on the `include` column and also we need to recode (because we're working on individual rows) instead of rename (used for columns).  The functionalized implementation of getting the recodes vars and the function `make_calculated_cols` can be found in 30.
+
+
+```{r recoding unit tests, purl=FALSE}
+#get what needs to be recoded that can't all be recoded at the same time
+recodes_vars <- cw_dfs$columns_conversion %>%
+  select(-c(pre_calc, keep_in_ds, use_in_model, dtype)) %>%
+  filter(!is.na(is_calc)) %>%
+  filter(str_detect(is_calc, '=')==FALSE) %>%
+  separate_rows(is_calc, sep=',') %>%
+  mutate(is_calc = recode(is_calc, 'n'='nashville',
+         's'='san_francisco',
+         'a' = 'austin'))
+
+recodes_vars
+
+#put in work
+releveled_dfs <- column_status_dfs %>%
+  imap(~make_calculated_cols(.x, city_name = .y, recode_tbl=recodes_vars, lookup_tbl = cw_dfs))
+
+##unit tests
+#get the columns that were recoded
+city_list %>%
+  map(~(select(releveled_dfs[[.]], filter(recodes_vars, is_calc==.) %>%
+                 drop_na(!!.) %>%
+                 pull(final_column_name)) %>%
+          count(!!!syms(colnames(.)))))
+```
+Things appear to be working correctly - great!  We can see that all of the recoded columns are populated with the desired recoded values, and each type is represented.
+
+
+## Implement city-specific preprocessing
+This is currently unused, but left here in case we do need to use it.  It has essentially been deprecated in favor of a switch statement.
+
+```{r postprocessing for dfs}
+add_individual_dfs_proc <- function(dfs, post_funcs=NULL, ...){
+  #' add_individual_dfs_proc: function to assist in performing joint preprocessing.  Currently deprecated in favor of switch statement.
+  #' Not intended to be used directly
+  #'
+  #' @param dfs : named dataframes to process
+  #' @param post_funcs : named list of functions to be applied to individual dataframes
+  #' @param ... : list of other named arguments to pass to individual functions
+  #'
+  #' @return dataframes with processing functions applied to each one
+
+  #if it's null, no postprocessing was needed
+  if(is.null(post_funcs))
+    return(dfs)
+  
+  #get the keyword arguments passed in
+  addtnl_args <- flatten(list(...))
+  
+  #otherwise, execute the specified functions on each individual df;
+  #not that !!!..3 is splitting that argument into keyword
+  post_dfs <- pmap(list(post_funcs, dfs, addtnl_args), ~exec(..1, ..2, !!!..3))
+  
+  return(post_dfs)
+}
+
+```
+
+
+## Fixing dtypes
+It looks like at at least the format of the permit number differs between datasets.  Let's help all of the different columns to have standardized datatypes.  Note that we use `type_convert` here from the readr package and require in the crosswalk that these type notations are used.  This function can be found in 30.
+
+
+### Unit tests
+Here, we're just going to make a super big dataframe so we can see the results in totality
+```{r construction subtype and type unit tests, purl=FALSE}
+full_dfs <- releveled_dfs %>%
+  map(~fix_datatypes(., cw_dfs)) %>%
+  imap(~mutate(.x, city_name = .y)) %>%
+  map(~arrange(., desc(permit_number)))
+
+#Are the desired colnames the same across datasets?
+cols_agg <- full_dfs %>%
+  map(~tibble('column_names'=colnames(.))) %>%
+  map2(names(full_dfs), ~mutate(.x, this_city = .y)) %>%
+  bind_rows()
+  
+cols_agg %>%
+  add_count(column_names, name='city_col_count') %>%
+  mutate(col_in_city = 1) %>%
+  pivot_wider(names_from=this_city, values_from=col_in_city, values_fill=0, values_fn=mean) %>%
+  arrange(desc(city_col_count))
+
+#Have the datatypes been correctly converted?
+full_dfs %>%
+  map(glimpse)
+```
+These functions appear to produce the correct results and the `const_sub_orig` and `construction_subtype` columns can be visually inspected (and were) to assure that the values were matched correctly.
+
+# Generation of composed dataframe prior to adding calculated columns
+
+```{r generate final dataframe, purl=FALSE}
+
+#get columns to keep
+keep_cols <- cw_dfs$columns_conversion %>%
+  filter(keep_in_ds==1 | use_in_model==1) %>%
+  pull(final_column_name)
+
+#now let's cut down the dataset to the columns of interest
+#and generate the final dataset.
+final_df <- full_dfs %>%
+  map(~select(., city_name, any_of(keep_cols))) %>%
+  map_dfr(~select(., city_name, permit_number, everything()))
+
+#when the type of this column is glimpsed, it looks like a lot of NAs.
+#Let's jointly see how many NAs there are here along with confirming the datatype
+final_df %>%
+  summarize(across(where(is.Date), ~sum(is.na(.))))
+
+str_c('Size of final dataframe: ', nrow(final_df))
+str_c('Size of original dataframes: ', map(full_dfs, nrow))
+str_c('Added processed df sizes: ', sum(map_dbl(full_dfs, nrow)))
+  
+```
+We see a few things here that we like:
+
+1. The renamed columns appear to be correctly populated across datasets
+2. The statuses appear to be correctly renamed and consistent.  There are just a few NA in Austin, and these were the same exact 15 from the original
+3. The size of the final dataframe did not appear to lose any rows.
+
+# Final additions to features
+Here, we can test the joint calculations generated by the `make_joint_calculated_cols` found in 30.
+
+```{r final feature engineering and unit tests, purl=FALSE}
+## Do the functions
+add_feat_dfs <- final_df %>%
+  make_joint_calculated_cols(cw_dfs)
+
+##Unit tests
+#Is the project_duration well-populated with values?
+add_feat_dfs %>%
+  ggplot(aes(y=project_duration)) +
+  geom_boxplot() + 
+  facet_wrap(facets='city_name', scales='free_y')
+
+#Is this fiscal year well-populated with values?
+add_feat_dfs %>%
+  ggplot(aes(y=fiscal_year_issued, fill=city_name)) +
+  geom_boxplot() 
+
+#are comm_v_res and project_type seemingly correct?
+add_feat_dfs %>%
+  count(comm_v_res, city_name)
+add_feat_dfs %>%
+  count(project_type, city_name)
+  
+#Let's make sure everything is still looking good
+add_feat_dfs%>%count(city_name, status)
+add_feat_dfs%>%count(city_name, construction_subtype)
+add_feat_dfs%>% filter(is.na(status))
+```
+
+# Write to file
+This is now written to file.  Note that if you want to repeat this in the future, you'll need to set `eval=TRUE` in the chunk header.  Also, avoid using this chunk, instead, use the 30 file `load_permits` function with `regenerate=TRUE` and `save_regen=TRUE` to regenerate the data.
+```{r write final to file, eval=FALSE, purl=FALSE}
+#write_feather(final_df, expand_boxpath('all-permits-structured.feather'))
+```
+
+
+
+
+

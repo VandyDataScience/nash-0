@@ -1,0 +1,111 @@
+---
+title: "44-tonnage-experiments"
+output: html_notebook
+---
+
+```{r load libs for experiments}
+source(knitr::purl("43-tonnage-predictions.Rmd", output="tmp-44.R", quiet=TRUE))
+fs::file_delete("tmp-44.R")
+p_load(DataExplorer)
+```
+
+Based on some EDA (at the end of this file), the columns that can actually be used as features are: `const_cost`, `project_type`, `comm_v_res`, and `construction_subtype.` We'll also want as IDs `permit_number`, `permit_subtype_description`, and `council_dist` as these will be sampled when generating synthetic permits. Last, we'll keep `date_issued` as this is needed for aggregation. (Note from the future - I tried including `date_issued` as a feature (with a step to extract the month). The results showed extreme variation in tonnage/quarter despite little difference in npermits/quarter. This seemed spurious to me, so I removed it.)
+
+```{r load desired cols}
+outcome <- "total_debris"
+predictors <- c("const_cost", "project_type", "comm_v_res", "construction_subtype","date_issued")
+indicators <- c("permit_number", "permit_subtype_description", "council_dist")
+
+cols_to_keep <- c(outcome, predictors, indicators)
+
+train_city <- "all"        # sf and austin (nashville gets cut out bc no per-permit tonnages)
+max_outcome <- 40000       # cut from training all values with more than this for total_debris
+splits <- train_test_historical(train_city = train_city, outcome = outcome, max_outcome = max_outcome, cols_to_keep = cols_to_keep)
+```
+
+We can experiment with slightly different recipes. For now, I just use the default defined in `43`.
+
+```{r set up recipe}
+model_recipe <- get_default_recipe(train = splits$train, outcome = outcome)
+```
+
+
+```{r train and display model}
+train_display_model <- function(model_type, engine){
+  my_model <- create_model(splits$train, splits$test, model_type = model_type, engine = engine, 
+                           outcome = outcome, model_recipe = model_recipe)
+  
+  # show some components of model -- test df and metrics are most interesting
+  show(my_model$test)
+  show(my_model$test_metrics)
+  
+  # show plot of training predictions
+  show(plot_pred_vs_true(my_model$train, total_debris))
+  
+  return(my_model)
+}
+```
+
+
+```{r train models}
+lr_model <- train_display_model(model_type = linear_reg(), engine = "lm")
+poly_model <- train_display_model(model_type = svm_poly(), engine = "kernlab")
+tree_model <- train_display_model(model_type = rand_forest(mode = "regression", min_n = 4, trees = 200), engine = "randomForest")
+nn_model <- train_display_model(model_type = mlp(mode = "regression", penalty = 0.01, epochs = 100), engine = "nnet")
+```
+
+
+```{r save this model}
+# model_fname <- expand_boxpath("models/nn_model.rds")
+# nn_model %>%
+#   saveRDS(model_fname)
+```
+
+
+
+
+
+
+
+# EDA
+
+Set up historical Nashville as testing, Austin + SF as training. We cut out values with total debris above a threshold. There's also a default to cut out zero-tonnage values. We'll start by loading in the full dataframes and investigate the missingness.
+
+```{r load in data for training and testing, purl=FALSE}
+train_city <- "all"        # sf and austin (nashville gets cut out bc no per-permit tonnages)
+outcome <- "total_debris"  
+max_outcome <- 40000       # cut from training all values with more than this for total_debris
+
+splits <- train_test_historical(train_city = train_city, outcome = outcome, max_outcome = max_outcome)
+```
+
+Upon initial load, there are a lot of missing columns in each of these dataframes.
+
+```{r missingness, purl=FALSE}
+splits$train %>% plot_missing()
+splits$test %>% plot_missing()
+```
+
+We want to know which columns are prevalent in both of these dataframes. We extract columns that are below the passed threshold of missingness in both the training and testing sets. The plots verify that it works:
+
+```{r extract cols with low missingness, purl=FALSE}
+good_cols <- common_cols_lowmiss(splits, thresh = 0.35)
+good_cols
+
+for(df_name in splits){
+  df_name %>% 
+    select(all_of(good_cols)) %>% 
+    plot_missing()
+}
+```
+
+
+We really aren't left with too much here. Let's look at these remaining columns for each of the dataframes:
+
+```{r examine nonmissing cols, purl=FALSE}
+splits$train %>% 
+  select(all_of(good_cols))
+
+splits$test %>% 
+  select(all_of(good_cols))
+```

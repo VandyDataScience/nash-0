@@ -3,10 +3,870 @@ title: "30-feature-engineering"
 output: html_notebook
 ---
 
-The purpose of this notebook is feature engineering - to either use the current features or generate new features based upon them.  The data should also be tested here to ensure that the features generated meet expectations and assuptions about them.
+The purpose of this notebook is feature engineering - to either use the current features or generate new features based upon them.  The data should also be tested here to ensure that the features generated meet expectations and assumptions about them.
 
-```{r}
-#Helpful imports
-library(assertr)
+```{r required libraries for feat eng}
+source(knitr::purl("10-load-data.Rmd", quiet=TRUE))
+fs::file_delete("10-load-data.R")
+p_load(tictoc)
+```
+
+
+```{r load full dataset}
+load_permits <- function(city, essentials_only=TRUE, regenerate=FALSE, crosswalk_fpath=NULL, save_regen=FALSE) {
+  #' load_permits: Loading the full predictor and outocme data with standardized column names and levels
+  #'
+  #' @param city character string or vector with desired city names to include ('nashville', 'nash', 'nsh', 'austin', 'aus', 'san_francisco', 'san francisco', and 'sf' allowed)
+  #' @param essentials_only (default TRUE) boolean of whether to include full dataset or just include all of Nashville + Austin and SF data with outcome variables only
+  #' @param regenerate (default FALSE) boolean of whether to use the crosswalk spreadsheet to completely regenerate the dataset (note: takes a while, use if you have new levels or columns)
+  #' @param crosswalk_fpath (default NULL) string of full filepath to crosswalk if another is desired
+  #' @param save_regen (default FALSE) whether to overwrite the regenerated dataset (relevant only if regenerate=TRUE) with the new information.  Will not save if you select less than 3 unique cities.
+  #'
+  #' @return returns a tibble of the structured dataset for the selected cities based on argument parameters
+  #' @export
+  #'
+  #' @examples test<- load_permits('all', essentials_only = FALSE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE)
+  
+  
+  #make dictionary
+  city <- tolower(city)
+  city_names <- map(city, ~switch(.,
+                                  'all' = c('nashville', 'austin', 'san_francisco'),
+                                  'austin' = 'austin',
+                                  'aus' = 'austin',
+                                  'nashville' = 'nashville',
+                                  'nash' = 'nashville',
+                                  'nsh' = 'nashville',
+                                  'san_francisco' = 'san_francisco',
+                                  'san francisco' = 'san_francisco',
+                                  'sf' = 'san_francisco',
+                                  'san' = 'san_francisco',
+                                  stop("Please enter full city name or simply enter 'all' to return the specified dataframe"))) %>%
+    flatten()
+  
+  if(regenerate){
+    structured_data <- generate_structured_dataset(city_list=unlist(city_names), essentials_cut=essentials_only, cw_filepath=crosswalk_fpath, save_new=save_regen)
+    return(structured_data)
+  }
+  
+  #Otherwise, lets load the dataset of interest
+  if(essentials_only){
+    read_fname <- expand_boxpath('structured_data_essentials_only.feather')
+  } else {
+    read_fname <- expand_boxpath('structured_data_all.feather')
+  }
+  
+  #read the data
+  structured_data <- read_feather(read_fname)
+  
+  #get only the desired data
+  structured_data <- structured_data %>%
+    filter(city_name %in% city_names)
+  
+  return(structured_data)
+}
+
+```
+
+# Regenerating structured dataset
+## Helpers
+### Vectorized data reading
+```{r load city data}
+load_city_data <- function(cities, new_fpaths=NULL){
+  #' load_city_data: loads data of cities based on default filepaths or new filepaths if passed in
+  #' Not intended to be used directly
+  #'
+  #' @param cities : vector of cities to be loaded.  Acceptable values are 'nashville', 'san_francisco', 'austin', and cobinations of these.
+  #' @param new_fpaths : named list of city_name = relative filepath (in Box).  See cities for acceptable values
+  #'
+  #' @return named list of tibbles corresponding to the city names and city data read 
+  
+  #set default fpaths
+  fpaths <- c('nashville' = "Nashville/nash_permits.feather",
+              'austin' = "Austin, TX/austin_permits.feather", 
+              'san_francisco' = "San Fran, CA/full_tonnage_permit.feather")
+  
+  # Update any new fpaths
+  if(!is.null(new_fpaths)){
+    fpaths[names(new_fpaths)] = new_fpaths
+  }
+  
+  #Keep only fpaths for cities specified
+  fpaths <- fpaths[ names(fpaths) %in% cities ]
+  
+  #Fix fpath order
+  names(cities) <- cities
+  cities[names(fpaths)] <- fpaths
+  
+  #Load
+  dfs <- cities %>%
+    map(~read_feather(expand_boxpath(.))) %>%
+    set_names(names(cities)) %>%
+    map(~mutate(., across(where(is.character), tolower)))
+  
+  #Return
+  return(dfs)
+  
+}
+```
+
+```{r get the desired crosswalk information}
+get_crosswalk_sheets <- function(cw_fpath=NULL){
+  #' get_crosswalk_sheets: Obtaining the sheets of the crosswalk table
+  #' Not intended to be used directly.
+  #' 
+  #' @param cw_fpath (default NULL): full filepath for location of crosswalk.  If null, uses the default crosswalk path on Box ('~/Box/city_variable_crosswalk.xlxs)
+  #'
+  #' @return Named list of tibbles of all sheets read from the crosswalk; columns_conversion contains only variables whose variables are set to 1 in keep_in_ds or use_in_model
+  #' @export
+  
+  
+  if(is.null(cw_fpath)){
+    cw_fpath <- expand_boxpath('city_variable_crosswalk.xlsx')
+  }
+  
+  sheets <- excel_sheets(cw_fpath)
+
+  #load and clean names of read data sheets
+  cw_df_info <- sheets %>%
+    map(~read_excel(cw_fpath, sheet=.)) %>%
+    map(clean_names) %>%
+    set_names(sheets)
+  
+  #fix this sheet to whittle down info
+  cw_df_info$columns_conversion <- cw_df_info$columns_conversion %>%
+    filter(keep_in_ds ==1 | use_in_model==1) %>%
+    select(-contains('notes'))
+  
+  return(cw_df_info)
+  
+  
+}
+```
+
+### Pre-processing
+```{r helper to look up column name in lookup table}
+get_colname_lookup <- function(lookup_df, city_name, column_name){
+  #' get_colname_lookup: helper for lookup up the correct final column name for a particular city column 
+  #' Not intended to be used directly
+  #'
+  #' @param lookup_df : named list of read sheets from crosswalk with at least named element columns_conversion
+  #' @param city_name : string of city name
+  #' @param column_name : string of column name of interest
+  #'
+  #' @return : string of final_column_name corresponding to the column of interest for the city of interest
+  
+  #get conversion
+  const_sub_colname <- lookup_df$columns_conversion %>%
+    select(!!city_name, final_column_name) %>%
+    filter(final_column_name==!!column_name) %>%
+    pull(!!city_name)
+  
+  return(const_sub_colname)
+}
+```
+
+
+#### San Francisco
+```{r san francisco pre-processing}
+san_francisco_pre <- function(df, lookup_df){
+  #' san_francisco_pre : performs pre-processing for san francisco to assist with standardization
+  #' Not intended to be used directly
+  #'
+  #' @param df : tibble of san francisco data with no duplicates
+  #' @param lookup_df : naed list of read sheets from crosswalk with at least named element columns_conversion
+  #'
+  #' @return : san_francisco dataframe with preprocessing applied
+  
+  #generate the recoding dictionary
+  recode_dict <- lookup_df$col_form_number %>%
+    deframe()
+  
+  #mutate some calculated columns
+  df <- df %>%
+    mutate(number_of_floors = if_else(!is.na(proposed_stories), proposed_stories, existing_stories, missing=NA_real_),
+           housing_units = if_else(!is.na(proposed_units), proposed_units, existing_units, missing=NA_real_),
+           form_number = recode(form_number, !!!recode_dict, .default='other', .missing=NA_character_),
+           general_use = if_else(!is.na(proposed_use), proposed_use, existing_use, missing=NA_character_),
+           total_diversion = reuse + recycling,
+           max_end_date = max(close_date, end_date, na.rm=TRUE))
+  return(df)
+}
+```
+
+#### Austin
+```{r austin load tonnage}
+load_austin_tonnage <- function(){
+  #' load_austin_tonnage: reads data for Austin tonnage and performs relevant column selection and pre-processing to standardize column names
+  #' Not intended to be used directly.
+  #'
+  #' @return tibble of processed Austin tonnage data
+  
+#currently borrowed from 11-load-austin commit 4b152b282db9af4c1c580376e941a184dbfb9d45
+  austin_tonnages_read <- read_excel(expand_boxpath("Austin, TX/CDAPL - CD Permit List for Sharing.xlsx"), sheet =5) 
+  
+  austin_tonnages_all <- austin_tonnages_read %>%
+    filter(Attribute =='Reference Permit No.') %>%
+    select('Value', 'Attribute', contains('Tons'), contains('Date'), contains('Rate'),
+           'Project Summary Upload', 'Total Project Floor Area:', 'Street Address:', 'Zip Code:', 'Response Status') %>%
+    clean_names() %>%
+    rename(permit_number = value) %>%
+    mutate(permit_num_clean = str_replace_all(.$permit_number, "[^0-9]", "")) %>%
+    select(permit_num_clean, everything())
+  
+  #Austin tonnage has 4 duplicates
+  #2017131220: Because it has a 'Verified' and 'Draft' status
+  #2018111897: Appear to be two separate instances; the later one has less tonnage than the first so I assume this is an update
+  #2018067130: Appears to be accidentally entered twice by the same person
+  #2019037989: Appears to be accidentally entered twice by the same person
+  
+  #fix the second real duplicate
+  sep_inst <- austin_tonnages_all %>%
+    filter(permit_num_clean == '2018111897') %>%
+    mutate(last_updated_date = max(last_updated_date),
+           ending_date = max(ending_date),
+           date_created = min(date_created),
+           beginning_date = min(beginning_date)) %>%
+    mutate(across(contains('tons') | contains('rate'), sum)) %>% #this is a wrong calculation for rate, but it's what's happening
+    slice(1)
+  
+  austin_tonnages_dedup <- austin_tonnages_all %>%
+    filter(permit_num_clean != '2018111897') %>%
+    add_row(sep_inst)
+  
+  #fix the rest
+  austin_tonnages_dedup <- austin_tonnages_all %>%
+    group_by(permit_num_clean) %>%
+    arrange(factor(response_status, fct_relevel(c('Verified', 'Draft')))) %>%
+    slice(1) %>%
+    arrange(desc(last_updated_date)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    assert(is_uniq, permit_num_clean)
+  
+  return(austin_tonnages_dedup)
+}
+
+```
+
+```{r austin join with tonnage}
+put_austin_together <- function(tonnage_df, permits_df){
+  #' put_austin_together: function for joining together tonnage data with permit data
+  #' Not intended to be used directly.
+  #'
+  #' @param tonnage_df : tibble of Austin tonnage data, e.g., from load_austin_tonnage
+  #' @param permits_df : tibble of de-duplicated Austin permit data
+  #'
+  #' @return tibble of joined permit and tonnage data for Austin
+
+  
+  #lets first paint with some super broad strokes
+   permits_df <- permits_df %>%
+    group_by(permit_num_clean) %>%
+    mutate(const_cost = sum(total_valuation)) %>%
+    arrange(fct_relevel(status_current, c('active', 'final', 'expired')), desc(issued_date)) %>%
+    slice(1) %>%
+    ungroup() %>%
+    mutate(permit_num_clean = as.character(permit_num_clean))
+   
+   #now, we're just going to join on the permit_num_clean and move on
+   full_tonnage <- tonnage_df %>%
+     left_join(permits_df, by='permit_num_clean')
+   
+   return(full_tonnage)
+  
+}
+```
+
+```{r austin pre-processing}
+austin_pre <- function(df){
+  #' austin_pre: Performs pre-processing on Austin data
+  #' Not intended to be used directly.
+  #'
+  #' @param df : tibble of de-duplicated Austin permit data
+  #'
+  #' @return: tibble of joined Austin permit + tonnage data for years after 2010
+  
+  df <- load_austin_tonnage() %>%
+    put_austin_together(df) %>%
+    filter(year(issued_date) > 2010)
+  
+  return(df)
+}
+```
+
+#### Nashville
+```{r nashville pre-processing}
+nashville_pre <- function(df){
+  #' nashville_pre: Performs pre-processing on Nashville data to create better descriptors for calculating comm_v_res
+  #' Not intended to be used directly.
+  #'
+  #' @param df : tibble of de-duplicated Nashville permit data
+  #'
+  #' @return: Nashville data with an additional 'permit_description' column which is the combination of permit_type_description and permit_subtype_description
+  
+  df <- df %>%
+    mutate(permit_subtype_description = if_else(!str_detect(permit_type_description, 'commercial') &
+                                                  permit_subtype_description %in% c('accessory apartment', 'accessory structure, carport', 'accessory structure, decks',
+                                                                                    'accessory structure, garage', 'accessory structure, pools',
+                                                                                    'accessory structure, shed / storage bldg'),
+                                                str_c(permit_subtype_description, ' - residential'),
+                                                permit_subtype_description,
+                                                missing=NA_character_)) %>%
+    mutate(permit_subtype_description = if_else(permit_subtype_description=='non-commercial community gardens',
+                                            'residential community gardens',
+                                            permit_subtype_description,
+                                            missing=NA_character_)) %>%
+    unite("permit_description", permit_type_description, permit_subtype_description, sep = ' ', remove=FALSE)
+  
+  return(df)
+}
+
+```
+
+### Column renaming
+```{r lookup column rename}
+basic_col_rename <- function(data_df, lookup_df, city_name) {
+  #' basic_col_rename: renames all non-joint calculated columns to their corresponding final_variable_names in the crosswalk
+  #' Not intended to be used directly.
+  #'
+  #' @param data_df : tibble of city data
+  #' @param lookup_df : named list of tibbles from each sheet of the crosswalk, requiring at least sheet/named element columns_conversion
+  #' @param city_name : string of city name
+  #'
+  #' @return city with renamed colunns to correct name
+  
+  #select the data characterization column of interest
+  data_mdl_df <- lookup_df$columns_conversion #%>%
+    #filter(is.na(pre_calc))
+  
+  #create a named vector (lookup table) of renames
+  city_rename <- data_mdl_df %>%
+    drop_na(!!city_name) %>%
+    select(final_column_name, !!city_name) %>%
+    deframe()
+  
+  #mutate new columns and change the order
+  city_fixed_names <- data_df %>%
+    mutate(!!!map(city_rename, rlang::sym)) %>%
+    relocate(all_of(names(city_rename)))
+  
+  return(city_fixed_names)
+}
+
+```
+
+### Column releveling
+```{r fix levels of variables}
+column_relevel <- function(data_df, lookup_df, city_name, col_name) {
+  #' column_relevel : helper for 'make_calculated_cols' which changes all of the level names of a column to the standard level_name in the dataset
+  #' Not intended to be used directly.
+  #'
+  #' @param data_df : tibble of city data
+  #' @param lookup_df : named list of crosswalk spreadsheets, containing sheets named with 'col_'+col_name for releveling
+  #' @param city_name : name of city to relevel
+  #' @param col_name : column to relevel
+  #'
+  #' @return tibble of data with the specified column changed to have level_name 
+  
+  #get correct sheet name
+  conv_sheet <- str_c('col_', col_name)
+  
+  #create a named vector (lookup table) of renames
+  levels_rename <- lookup_df[[conv_sheet]] %>%
+    drop_na(!!city_name) %>%
+    filter(include==1) %>%
+    select(level_name, !!city_name) %>%
+    separate_rows(!!city_name, sep=', ') %>%
+    mutate(!!city_name := trimws(!!sym(city_name))) %>%
+    deframe()
+  
+  #do the releveling
+  releveled_df <- data_df %>%
+    mutate(!!col_name := map_dbl(!!sym(col_name), ~ifelse(any(str_detect(., levels_rename)),
+                                                          which(str_detect(., levels_rename)),
+                                                          NA_real_))) %>%
+    mutate(!!col_name := if_else(!is.na(!!sym(col_name)), names(levels_rename[!!sym(col_name)]), 'other', missing=NA_character_))
+  
+  #return
+  return(releveled_df)
+}
+
+```
+
+```{r make calculated columns with levels}
+make_calculated_cols <- function(df, city_name, recode_tbl, lookup_tbl){
+  #' make_calculated_cols: function which identifies all columns to be releveled and relevels them
+  #' Not intended to be used directly
+  #'
+  #' @param df : tibble for city of interest
+  #' @param city_name : name of city of interest
+  #' @param recode_tbl : table which contains all of the columns to be releveled
+  #' @param lookup_tbl : named list of all crosswalk spreadsheets containing columns to relevel
+  #'
+  #' @return tibble with columns releveled
+
+  
+  #get sheets column names corresponding to available excel sheets for recoding
+  calc_sheets <- recode_tbl %>%
+    filter(is_calc == !!city_name) %>%
+    select(final_column_name, !!city_name) %>%
+    filter(str_c('col_', final_column_name) %in% names(lookup_tbl)) %>%
+    pull(final_column_name)
+  
+  #get the partial function calls
+  relevel_partial <- calc_sheets %>%
+    map(~partial(column_relevel, lookup_df=lookup_tbl, city_name=city_name, col_name=!!.))
+  
+  #make them into one big function
+  #(because we need these to execute sequentially so a dataframe can be updated, this
+  #means we can't use the map functions here)
+  it_fcns <- compose(!!!relevel_partial)
+  
+  #execute the functions
+  exec_dfs <- it_fcns(df)
+  
+  return(exec_dfs)
+  
+}
+
+#small test case
+#column_status_dfs$nashville %>%
+#  make_calculated_cols('nashville', recode_tbl=recodes_vars, lookup_tbl=cw_dfs)
+```
+
+```{r figure out which variables we want to relevel}
+get_vars_to_relevel <- function(lookup_tbl){
+  #' get_vars_to_relevel: determining which variables to relevel that have matching functions in the global environment
+  #' Not intended to be used directly
+  #'
+  #' @param lookup_tbl named list of crosswalk correspondences for cities; vars to relevel indicated by comma separated values in the is_calc column
+  #'
+  #' @return tibble of variables to relevel
+  
+  recodes_vars <- lookup_tbl$columns_conversion %>%
+    select(-c(pre_calc, keep_in_ds, use_in_model, dtype)) %>%
+    filter(!is.na(is_calc)) %>%
+    filter(str_detect(is_calc, '=')==FALSE) %>%
+    separate_rows(is_calc, sep=',') %>%
+    mutate(is_calc = trimws(is_calc)) %>%
+    mutate(is_calc = recode(is_calc, 'n'='nashville',
+           's'='san_francisco',
+           'a' = 'austin'))
+  
+  return(recodes_vars)
+}
+```
+
+### Creating joint dataframe and adding calculated variables
+```{r get the structured combined dataset}
+bind_final_dfs <- function(dfs_list, lookup_tbl){
+  #' bind_final_dfs: concatenates by vertical stacking (bind_rows) all tibbles in list
+  #' Not intended to be used directly
+  #'
+  #' @param dfs_list : list of tibbles to be row-binded
+  #' @param lookup_tbl : named list of crosswalk sheets named element columns_conversion to be used to select the appropriate final columns
+  #'
+  #' @return concatenated tibbles
+  
+  
+  keep_cols <- lookup_tbl$columns_conversion %>%
+    pull(final_column_name)
+  
+  final_df <- dfs_list %>%
+    map(~select(., city_name, any_of(keep_cols))) %>%
+    map_dfr(~select(., city_name, permit_number, everything())) %>%
+    relocate(any_of(keep_cols), .after=permit_number)
+  
+  return(final_df)
+}
+```
+
+```{r fixing datatypes helper}
+fix_datatypes <- function(df, lookup_df){
+  #' fix_datatypes: function which changes all datatypes to the type specified in lookup_df$columns_conversion dtype column
+  #'
+  #' @param df : tibble of data to be be standardized
+  #' @param lookup_df : named list of crosswalk tibbles with at least the columns_conversion sheet/named element containing a dtype column
+  #'
+  #' @return tibble with datatypes corrected
+  #' @export
+  #'
+  #' @examples
+  
+  colconv <- lookup_df$columns_conversion %>%
+    drop_na(dtype) %>%
+    filter(final_column_name %in% colnames(df)) %>%
+    select(final_column_name, dtype) %>%
+    deframe() %>%
+    as.list()
+  
+  #retype based on current types in crosswalk.  Inelegant and manual, but effective
+  retype_df <- df %>%
+    mutate(across(.cols=names(colconv), .fns=as.character)) %>% #you have to convert everything to character first before type_convert
+    type_convert(col_types=colconv)
+  
+  return(retype_df)
+  
+}
+#pp_dfs$austin %>%
+#  fix_datatypes(cw_dfs)
+```
+
+### Joint calculations
+
+Borrowed from 34 to add permit prefix
+```{r adding permit prefixes}
+set_permit_prefix <- function(df, prefix) {
+  #' set_permit_prefix: adds a prefix to the permits to ensure uniqueness
+  #' Not intended to be used directly
+  #'
+  #' @param df : tibble of city dataframe with at least field "permit_number"
+  #' @param prefix : string of prefix to be prepended to the permit number
+  #'
+  #' @return tibble with prefix prepended to the permit number
+  
+  df <- df %>%
+    mutate(permit_number = str_c(prefix, '-', permit_number))
+  
+  return(df)
+}
+```
+
+```{r add project type}
+calc_project_type <- function(df){
+  #' calc_project_type: determines whether a permit is construction or demolition based on the project_type column
+  #' Not intended to be used directly
+  #'
+  #' @param df : full concatenated dataframe of all desired cities
+  #'
+  #' @return : full dataframe with project_type as "construction", "demolition", or "other"
+  
+  df <- df %>%
+    mutate(project_type = map_chr(project_type, ~if_else(any(str_detect(., c('demo', 'demolition'))), 'demolition', 'construction', missing=NA_character_)))
+  
+  return(df)
+}
+
+```
+
+```{r add project duration}
+calc_project_duration <- function(df, meas='days'){
+  #' calc_project_duration: determines the longevity of a project
+  #' Not intended to be used directly
+  #'
+  #' @param df : full concatenated dataframe of all desired cities
+  #' @param meas : (default 'days'): string of the unit of duration 
+  #'
+  #' @return : full dataframe with duration column added
+  
+  df <- df %>%
+    mutate(project_duration = as.numeric(difftime(completed_date, date_issued), unit=meas))
+  
+  return(df)
+}
+
+##unit test: working correctly
+#full_dfs$nashville %>%
+#  calc_project_duration() %>%
+#  filter(!is.na(project_duration)) %>%
+#  select(project_duration, completed_date, date_issued)
+```
+
+```{r add fy issued}
+calc_fiscal_year_issued <- function(df){
+  #' calc_fiscal_year_issued: determines what fiscal year a permit was issued
+  #' Not intended to be used directly
+  #'
+  #' @param df : full concatenated dataframe of all desired cities
+  #'
+  #' @return : full dataframe with fiscal_year_issued added
+  
+  df <- df %>%
+    mutate(fiscal_year_issued = if_else(month(date_issued) < 7, as.integer(year(date_issued)), as.integer(year(date_issued)+1), missing=NA_integer_))
+  
+  return(df)
+}
+
+##unit test: working correctly
+#full_dfs$nashville %>%
+#  calc_fiscal_year_issued() %>%
+#  filter(!is.na(date_issued)) %>%
+#  select(fiscal_year_issued, date_issued)
+```
+
+Note that the below is fixed because the first quarter occurs at the beginning of the fiscal year; this means that july - sept is the first quarter
+```{r add quarter issued}
+calc_quarter_issued <- function(df){
+  #' calc_quarter_issued: adds a column for the quarter in which a permit was issued
+  #' Not intended to be used directly
+  #'
+  #' @param df : full concatenated dataframe of all desired cities
+  #'
+  #' @return : full dataframe with quarter_issued column of integer
+  
+  df <- df %>%
+    mutate(quarter_issued = (quarter(date_issued) + 2) %% 4) %>%
+    mutate(quarter_issued = if_else(quarter_issued==0, 4, quarter_issued, missing=NA_real_))
+  
+  return(df)
+}
+##unit test: working correctly
+#full_dfs$nashville %>%
+#  calc_quarter_issued() %>%
+#  filter(!is.na(date_issued)) %>%
+#  select(quarter_issued, date_issued)
+```
+
+```{r function for same calculation over all cities}
+make_joint_calculated_cols <- function(total_df, lookup_df){
+  #' make_joint_calculated_cols : function which performs the en masse calculation for jointly calculated columns
+  #'
+  #' @param total_df : full concatenated tibble of all desired cities
+  #' @param lookup_df : named list of crosswalk sheets with at least named element column_conversion
+  #'
+  #' @return tibble with all additional columns added
+  #' @export
+  #'
+  #' @examples
+  
+  
+  #get the variables that need calculation
+  add_calcs_vars <- lookup_df$columns_conversion %>%
+    select(is_calc, final_column_name) %>%
+    filter(!is.na(is_calc)) %>%
+    filter(str_detect(is_calc, '=')) %>%
+    filter(str_c('calc_', final_column_name) %in% ls(.GlobalEnv)) %>%
+    pull(final_column_name)
+  
+  #get list of functions from global environment (don't do this)
+  funs_list <- str_c('calc_', add_calcs_vars) %>%
+    map(get)
+  
+  #compose the meta function
+  post_calc_funs <- compose(!!!funs_list)
+  
+  #do the deed
+  df <- post_calc_funs(total_df)
+  
+  return(df)
+}
+
+```
+
+```{r add generates waste boolean}
+add_generates_debris <- function(full_df){
+  #' add_generates_debris: adding the boolean column of generates_debris based on rules from domain expert.  Also fixes all debris generating permits to have a date issued by using the date entered if date issued is not present.
+  #' Not intended to be used directly
+  #'
+  #' @param full_df : final concatenated tibble (e.g., from bind_final_dfs)
+  #'
+  #' @return tibble with new column `generates_debris` with boolean values
+  
+  
+  #get the booleans together to indicate waste generation
+  full_df <- full_df %>%
+    mutate(generates_debris = if_else(permit_subtype_description=="sign - ground /  wall signs", FALSE, TRUE, missing=NA)) %>%
+    mutate(generates_debris = if_else(permit_type_description %in% c("building commercial - change contractor", "building residential - change contractor", "building sign permit", "building blasting permit"), FALSE, generates_debris, missing=NA)) %>%
+    mutate(generates_debris = if_else(city_name=="nashville", generates_debris, FALSE, missing=NA)) %>%
+    mutate(generates_debris = if_else(status %in% c('cancelled', 'revoked', 'refunded'), FALSE, generates_debris, missing=NA))
+  
+  #fix dates on waste generators
+  full_df <- full_df %>%
+    mutate(date_issued = if_else(generates_debris & is.na(date_issued), date_entered, date_issued, missing=NA_Date_))
+  
+  return(full_df)
+}
+```
+
+
+## Actual called function
+```{r code to generate structured dataset}
+generate_structured_dataset <- function(city_list=NULL, essentials_cut=TRUE, cw_filepath=NULL, save_new=FALSE){
+  #' generate_structured_dataset: function which uses the crosswalk and input parameters to create and optionally save full dataset
+  #'
+  #' @param city_list (default Null): vector of cities to be included in dataframe ('nashville', 'san_francisco', and 'austin' and combinations allowed as accepted values)
+  #' @param essentials_cut (default TRUE): boolean of whether to only include Nashville (if present) and permits with outcome tonnage from other cities
+  #' @param cw_filepath (default NULL): full filepath of crosswalk spreadsheet.  If NULL, the default Box filepath will be used
+  #' @param save_new (default FALSE): boolean of whether to save the newly regenerated data.  The data will only be saved if all cities are requested.
+  #'
+  #' @return tibble of structured dataset
+  #' @export
+  #'
+  #' @examples generate_structured_dataset(c('nashville', 'sf', 'austin'), essentials_cut=FALSE, save_new=FALSE)
+  
+  #I'm doing this here just in case things come up with the dataset, I can quickly change
+  #things using the 35 file
+  
+  if(is.null(city_list)){
+    city_list <- c('nashville', 'austin', 'san_francisco')
+  }
+  
+  #load cities
+  city_dfs <- city_list %>%
+    load_city_data()
+  
+  #load crosswalk info
+  cw_dfs <- get_crosswalk_sheets(cw_fpath=cw_filepath)
+  
+  #add preprocessing
+  city_dfs <- city_dfs %>%
+    imap(~switch(.y, 'nashville' = nashville_pre(.x),
+                    'san_francisco' = san_francisco_pre(.x, cw_dfs),
+                    'austin' = austin_pre(.x),
+                    return(.x)))
+  
+  #rename columns
+  col_renamed_dfs <- city_dfs %>%
+    imap( ~basic_col_rename(.x, lookup_df=cw_dfs, city_name=.y))
+    
+  #re-level column values
+  vars_to_recode <- get_vars_to_relevel(cw_dfs)
+  releveled_dfs <- col_renamed_dfs %>%
+    imap(~make_calculated_cols(.x, city_name = .y, recode_tbl=vars_to_recode, lookup_tbl = cw_dfs))
+  
+  #fix datatypes, add name, and add permit prefix
+  prefixes <- c('nashville' = 'nsh', 'san_francisco' = 'sf', 'austin' = 'aus')
+  prefixes <- prefixes[city_list]  
+  full_dfs <- releveled_dfs %>%
+    map(~fix_datatypes(., cw_dfs)) %>%
+    imap(~mutate(.x, city_name = .y)) %>%
+    map2(prefixes, ~set_permit_prefix(df=.x, prefix=.y))
+  
+  #essentially row-bind dataset and get out the columns from the crosswalk
+  df_all <- bind_final_dfs(full_dfs, cw_dfs)
+  
+  #add group calculated columns
+  final_df <- df_all %>%
+    add_generates_debris() %>%
+    make_joint_calculated_cols(cw_dfs)
+    
+  
+  #make the essentials cut maybe
+  if(save_new | essentials_cut){
+    ecut <- final_df %>%
+      filter(city_name=='nashville' | !is.na(total_debris))
+  }
+  
+  #maybe save
+  if(save_new){
+    if(length(unique(city_list))<3){
+      warning("Can't save an updated structured with less than the full 3 cities data present.")
+    } else {
+      write_feather(final_df, expand_boxpath('structured_data_all.feather'))
+      write_feather(ecut, expand_boxpath('structured_data_essentials_only.feather'))
+    }
+  }
+  
+  #maybe only get the relevant information
+  if(essentials_cut){
+    final_df <- ecut
+  }
+  
+  return(final_df)
+}
+
+```
+
+# Unit tests
+## On rote functionality
+```{r loading unit tests, purl=FALSE, eval=FALSE}
+#Unit tests (uncomment to try yourself)
+## Basic Functionality
+#test <- load_permits('cat')
+#test<- load_permits('all', essentials_only = FALSE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test<- load_permits(c('nashville', 'san francisco'), essentials_only = FALSE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test<- load_permits(c('nsh', 'sf'), essentials_only = FALSE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test<- load_permits('all', essentials_only = FALSE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test<- load_permits('all', essentials_only = FALSE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test <- load_permits('all', essentials_only = TRUE, regenerate=FALSE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+#test <- load_permits(c('sf', 'aus'), essentials_only=TRUE, regenerate=TRUE, save_regen=TRUE) #Pass
+
+## Using regen
+#tic()
+#test <- load_permits('all', essentials_only = TRUE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = FALSE) #pass
+#toc() #385.42 sec = 6.4 minutes #old (full austin)
+
+#tic()
+#test <- load_permits('all', essentials_only = FALSE, regenerate=TRUE, save_regen=TRUE) #pass
+#toc() #185.14 sec = 3.1 minutes #current
+
+#tic()
+#test <- load_permits('sf', essentials_only = FALSE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = FALSE) #pass
+#toc() #1.95 sec #old
+
+## regeneration alone tests
+#test <- generate_structured_dataset(essentials_cut=FALSE, save_new=FALSE) #pass
+```
+
+## On Nashville behavior
+```{r nashville behavior unit tests, purl=FALSE, eval=FALSE}
+nash_test <- load_permits('nsh', essentials_only = FALSE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = FALSE)
+
+## does comm_v_res have the correct associations?
+nash_test %>%
+  count(comm_v_res, permit_type_description, permit_subtype_description) %>%
+  View() #pass
+
+#are all generates_debris FALSE for the selected statuses?
+nash_test %>%
+  count(generates_debris, status) %>%
+  View() #pass
+
+#are all generates_debris FALSE for selected types and subtypes?
+nash_test %>%
+  filter(permit_subtype_description == "sign - ground /  wall signs" | permit_type_description %in% c("building commercial - change contractor",
+                                                                                                      "building residential - change contractor",
+                                                                                                      "building sign permit",
+                                                                                                      "building blasting permit")) %>%
+  count(generates_debris, permit_type_description, permit_subtype_description) %>%
+  View()#pass
+
+#are all signs found with other permit_type_descriptions false for generates debris?
+nash_test %>%
+  filter(str_detect(permit_subtype_description, 'sign')) %>%
+  count(generates_debris, permit_type_description, permit_subtype_description) #pass
+
+#do all debris-generating permits have a date_issued
+nash_test %>%
+  filter(generates_debris) %>%
+  summarize(num_na = sum(is.na(date_issued))) #pass
+
+#how many are there where date_issued = date_entered?
+nash_test %>%
+  filter(generates_debris, date_issued == date_entered) %>%
+  nrow() #21081 total, where 12283 already originally matched and 8798 were na for date_issued #pass
+
+#final EDA counts
+nash_test %>%
+  filter(comm_v_res=='other') %>%
+  count(permit_type_description, permit_subtype_description)
+  
+```
+
+## Full behavior
+```{r unit tests for full behavior, purl=FALSE, eval=FALSE}
+#load permits
+test<- load_permits('all', essentials_only = FALSE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = FALSE) #Pass
+
+#do we have a correct looking set of statuses?
+test %>%
+  count(city_name, status) #pass
+
+#do we have correct looking comm_v_res and project_types?
+test %>%
+  count(city_name, comm_v_res, project_type) #pass
+
+#is generates_debris false for every other city and the counts for nash look correct?
+test %>%
+  count(city_name, generates_debris) #pass
+
+#are the others seemingly reasonable for comm_v_res in Nashville?
+test %>%
+  filter(city_name=='nashville', comm_v_res=='other') %>%
+  count(comm_v_res, permit_type_description, permit_subtype_description) #pass
+
+#save
+test<- load_permits('all', essentials_only = FALSE, regenerate=TRUE, crosswalk_fpath = NULL, save_regen = TRUE) #Pass
 ```
 

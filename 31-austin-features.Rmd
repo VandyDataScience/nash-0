@@ -1,0 +1,141 @@
+---
+title: "31-austin-features"
+output: html_notebook
+---
+
+The purpose of this notebook is feature engineering - to either use the current features or generate new features based upon them.  The data should also be tested here to ensure that the features generated meet expectations and assumptions about them.
+
+```{r Load}
+source(knitr::purl("10-load-data.Rmd"))
+fs::file_delete("10-load-data.R")
+
+
+austin_permits <- read_feather(expand_boxpath("Austin, Tx/austin_permits.feather"))
+res_demo_permits <- read_feather(expand_boxpath("Austin, Tx/austin_res_demo_permits.feather"))
+austin_tonnages <- read_feather(expand_boxpath("Austin, Tx/austin_tonnages.feather"))
+```
+
+
+``` {r make final}
+
+selected <- austin_tonnages %>%
+  select(permit_num_clean, `Total Tons`, `Submitted Permit Type`) %>%
+  filter(`Submitted Permit Type` == "Reference")
+
+
+
+selected$permit_num_clean <- as.numeric(selected$permit_num_clean)
+
+
+# test <- aggregate(austin_permits[, !names(austin_permits) %in% c("total_valuation")], by=list(Category=austin_permits$permit_num_clean), FUN=max)
+# test$total_valuation = combined
+# length(unique(test$permit_num_clean))
+# 
+# test_almost_final <- test %>%
+#           filter (total_valuation != 0) %>%
+#           rename(const_cost = total_valuation)
+# 
+# 
+# test_joined <- left_join(tonnage_almost_final, test_almost_final, by = "permit_num_clean")
+# 
+# test_final <- test_joined %>%
+#   filter(!is.na(`Total Tons`)) %>%
+#   filter(`Total Tons` > 0) %>%
+#   rename(permit_number = permit_num_clean,
+#          tonnage = `Total Tons`, const_cost = const_cost)
+# test_final$const_cost <- test_final$const_cost$x
+# write_feather(test_final, expand_boxpath("Austin, Tx/tonnages_with_all_features.feather"))
+
+aggregate_tonnages <- aggregate(selected$`Total Tons`, by=list(Category=selected$permit_num_clean), FUN=max)
+
+combined = aggregate(austin_permits$total_valuation, by=list(Category=austin_permits$permit_num_clean), FUN=sum)
+
+aggregate_date_issued = aggregate(austin_permits$issued_date, by=list(Category=austin_permits$permit_num_clean), FUN=max)
+
+aggregate_permit_class = aggregate(austin_permits$permit_class_mapped, by=list(Category=austin_permits$permit_num_clean), FUN=max)
+
+demo_classes <- c("Demolition", "Demo", "Interior Demo Non-Structural")
+
+austin_permits$project_type[austin_permits$permit_class %in% demo_classes] <- "demolition"
+
+austin_permits$project_type[!(austin_permits$permit_class %in% demo_classes)] <- "construction"
+
+aggregate_project_type = aggregate(austin_permits$project_type, by=list(Category=austin_permits$permit_num_clean), FUN=max)
+
+combined$date_issued = aggregate_date_issued$x
+combined$comm_v_res = tolower(aggregate_permit_class$x)
+combined$project_type = aggregate_project_type$x
+
+almost_final <- combined %>%
+          filter (x != 0) %>%
+          rename(permit_num_clean = Category,
+                 const_cost = x)
+tonnage_almost_final <- aggregate_tonnages %>%
+          filter (x != 0) %>%
+          rename(permit_num_clean = Category,
+                 `Total Tons` = x)
+
+
+joined <- left_join(tonnage_almost_final, almost_final, by = "permit_num_clean")
+  
+final <- joined %>%
+  filter(!is.na(`Total Tons`)) %>%
+  filter(`Total Tons` > 0) %>%
+  rename(permit_number = permit_num_clean,
+         tonnage = `Total Tons`)
+
+# This section explores some aspects of the data after it has been finalized for the model
+final_data_eda(final)
+
+write_feather(final, expand_boxpath("Austin, Tx/ready_for_first_model.feather"))
+```
+
+
+
+
+## Final EDA
+```{r final EDA}
+
+
+#There were some elements of exploring the Austin Tonnage data that couldn't be done unntil it was joined with the permit data set, so I had to put it in this file instead of the 20 file. One of the main things that I wanted to address here was Adam noted that Nashville had a much higher percentage of residential construction than Greeen Halo did. Luckily, it seems like Austin has slightly more than Green Halo, but still much less than Nashville.
+
+
+final_data_eda <- function(data){
+  
+  com_const <- data %>%
+    filter(comm_v_res == "commercial") %>%
+    filter(project_type == "construction")
+  
+  com_demo <- data %>%
+    filter(comm_v_res == "commercial") %>%
+    filter(project_type == "demolition")
+  
+  res_const <- data %>%
+    filter(comm_v_res == "residential") %>%
+    filter(project_type == "construction")
+  
+  res_demo <- data %>%
+    filter(comm_v_res == "residential") %>%
+    filter(project_type == "demolition")
+  
+  
+  num_com_const <- nrow(com_const)
+  num_com_demo <- nrow(com_demo)
+  num_res_const <- nrow(res_const)
+  num_res_demo <- nrow(res_demo)
+  
+  points <- rbind(c(num_com_const, num_com_demo, num_res_const, num_res_demo))
+  labels <- c("Commercial Connstruction", "Commercial Demolition", "Residential Construction", "Residential Demolition")
+  barplot(points, names.arg=labels)
+  
+}
+
+
+
+
+
+
+
+```
+
+

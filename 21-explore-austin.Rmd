@@ -1,0 +1,398 @@
+---
+title: "21-explore-austin"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_notebook:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    number_sections: yes
+---
+
+## Load libs, common functions
+```{r Load, results='hide', message=FALSE, warning=FALSE}
+source(knitr::purl("11-load-austin.Rmd"))
+fs::file_delete("11-load-austin.R")
+p_load(ggplot2, OpenStreetMap, rgdal, leaflet, sp, Hmisc)
+```
+
+
+## Basic EDA
+
+First we can take a look at the datasets and right away see that the residential permit set is TINY compared to the overall set
+
+``` {r Dims}
+dim(austin_permits)
+dim(res_demo_permits)
+
+```
+
+
+From there I was interested in exploring the range of time occupied by the permits. Crazily enough, it seems to go all the way back to 1921, though as shown in the histogram, the frequency goes up dramatically when we hit the 80s. Only 2265 permits exist from before 1980, so if necesary, we can effectively ignore those.
+
+```{r Years}
+austin_permits %>%
+  filter(calendar_year_issued < 1980) %>%
+  nrow()
+
+austin_permits %>%
+  summarize_if(is.numeric, range, na.rm=TRUE)
+
+austin_permits %>%
+  ggplot(aes(x=calendar_year_issued)) +
+  geom_bar(position='dodge')
+
+```
+  
+Most of the columns were almost entirely full, but I wanted to take a look at some columns that had a low density of non-N/A values. 
+I separated them into 3 categories that I believe are uniquely distinct:
+
+Medium density, which contained a substantial amount of missing columns, but also a substantial amount of data.
+
+Low density sqft, which were sqft related columns that were almost entirely empty.
+
+And finally low density valuation, which had valuation related columns that were almost entirely empty.
+``` {R Densities}
+med_density_columns = c("number_of_floors", "housing_units")
+low_density_columns_sqft = c("total_existing_bldg_sqft", "remodel_repair_sqft", "total_new_add_sqft")
+
+low_density_columns_valuation = c("total_valuation_remodel", "total_job_valuation", "building_valuation", "building_valuation_remodel", "electrical_valuation", "electrical_valuation_remodel", "mechanical_valuation", "mechanical_valuation_remodel", "plumbing_valuation", "plumbing_valuation_remodel", "med_gas_valuation_remodel")
+
+```
+
+
+From there we can analyze how full  those columns are. I used the inverses of the sqft and valuation categories so that I could sum up the number of non-N/A value present in any of the columns.
+
+For the valuation columns, this summed almost exactly to 1, leading me to believe there is almost exactly one valuation per sub-permit (will discuss sub-permits later), but its not exact. I'll have to do a little more research to determine exactly what the slight discrepancy is.
+``` {r Density Calculations}
+med_column_densities =  select(austin_permits, all_of(med_density_columns)) %>%
+  map(~sum(is.na(.))/length(.))
+
+med_column_densities
+
+inverse_valuation_column_densities =  select(austin_permits, all_of(low_density_columns_valuation)) %>%
+  map(~(1-sum(is.na(.))/length(.)))
+
+inverse_valuation_column_densities
+Reduce("+",inverse_valuation_column_densities)
+
+inverse_sqft_column_densities =  select(austin_permits, all_of(low_density_columns_sqft)) %>%
+  map(~(1-sum(is.na(.))/length(.)))
+
+inverse_sqft_column_densities
+Reduce("+",inverse_sqft_column_densities)
+```
+
+## Map
+This still needs some touching up, but is intended to help visualize the locations of permits on a map. In order to keep computation reasonable, I'm currently plotting a random sample of 100,000 and using clustering to reduce the visual load. This allows an interactive way to roughly visualize where permits are coming from. 
+
+In the future, I would like to update this map to be able to show how the locations of the permits changed through the years.
+
+```{r Visualize Map, results = 'hide', message=FALSE, warning=FALSE}
+
+map <- openmap(c(30.0000,-98.00000),
+     c(31.05,-97.00009), zoom=10,'osm')
+
+```
+
+``` {r Map Part 2}
+dropped <- sample_n(drop_na(austin_permits, latitude, longitude),100000)
+coordinates(dropped)<-~longitude+latitude
+# proj4string(dropped)<-CRS("+init=epsg:4326")
+# plot(map)
+# points(spTransform(head(dropped),osm()),cex=1000)
+leaflet(dropped) %>% addTiles() %>% addMarkers(
+  clusterOptions = markerClusterOptions()
+)
+
+
+```
+
+
+
+
+## Unique Permits
+There are many repeated permit numbers within the data set, likely because of multiple permits being required for different elements of the same job. This section attempts to answer questions about the nature of those permits. The main data set contains mostly unique permits, and maxes out at 5 permits per permit number. This indicates that a job site may have up to 1 permit of each permit type, given that there are 5 permit types. The demolition set has entirely unique permit numbers.
+
+``` {r Examine Unique Permits}
+num_total_ids <- length(austin_permits$permit_num_clean)
+num_unique_ids <- length(unique(austin_permits$permit_num_clean))
+num_total_ids - num_unique_ids
+
+unique_ids <- unique(austin_permits$permit_num_clean)
+austin_permits$permit_num_clean<- as.numeric(austin_permits$permit_num_clean)
+austin_permits_repeat_count = austin_permits %>% select(permit_num_clean) %>%
+  group_by(permit_num_clean) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(-count)
+
+austin_permits_repeat_count
+hist(austin_permits_repeat_count$count)
+
+```
+
+
+This performs the same calculations as the previous chunk, except this time on the demo set. The results are much less interesting though, due to all of the permit numbers being unique.
+
+``` {r Demos Unique}
+demo_unique_ids <- unique(res_demo_permits$permit_num_clean)
+res_demo_permits$permit_num_clean<- as.numeric(res_demo_permits$permit_num_clean)
+demo_permits_repeat_count = res_demo_permits %>% select(permit_num_clean) %>%
+  group_by(permit_num_clean) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(-count)
+
+demo_permits_repeat_count
+hist(demo_permits_repeat_count$count)
+
+```
+
+## Construction VS Demolition
+This section is intended to answer some of our questions about numbers is relation to Construction vs. Demolition. Currently it contains information and visualizations related to the number of permits of different types, though it will be updated with debris information when that is received.
+
+
+This examines total residential demolitions versus partial residential demolitions, just to give an idea of the scale of demolitions, as well as make it easier to interface with other data sets that make this distinction in different ways.
+``` {r Residential Demolitions}
+num_residential_demolitions <- nrow(res_demo_permits)
+
+num_total_residential_demolitions <- length(res_demo_permits$demolition_category[res_demo_permits$demolition_category == "Total Demolition"])
+
+num_partial_residential_demolitions <- length(res_demo_permits$demolition_category[res_demo_permits$demolition_category == "Partial Demolition"])
+
+res_demo_points <- rbind(c(num_total_residential_demolitions, num_partial_residential_demolitions))
+res_demo_labels <- c("Complete Residential Demolitions", "Partial Residential Demolitions")
+res_demo_permits %>%
+  ggplot(aes(x=calendar_year_issued, fill=demolition_category)) +
+  geom_bar(position='dodge')
+
+```
+
+
+Next we can start pulling overall information about constructions versus demolitions. This will help answer the continuous questions we've had about how much of a share of the debris demolitions take up. I anticipate this information being much more useful when the debris data arrives. 
+``` {r CVD}
+
+
+# demo_classes <- demo_unique_table$work_class
+demo_classes <- c("Demolition", "Demo", "Interior Demo Non-Structural")
+demolitions <- austin_permits[austin_permits$work_class %in% demo_classes,]
+num_demolitions <- nrow(demolitions)
+num_commercial_demolitions <- length(demolitions$permit_class_mapped[demolitions$permit_class_mapped == "Commercial"])
+
+num_constructions <- nrow(austin_permits) - num_demolitions
+
+total_points <- rbind(c(num_demolitions, num_constructions))
+total_labels <- c("Total Demolition Permits", "Total Construction Permits")
+barplot(total_points, names.arg=total_labels)
+
+```
+
+
+Finally we analyze the breakdown between Commercial versus residential demolitions, as we can expect this to be an important factor in how much debris a project generates.
+``` {r RVC}
+
+demo_points <- rbind(c(num_demolitions, num_commercial_demolitions, num_residential_demolitions))
+demo_labels <- c("Total Demolitions", "Commercial Demolitions", "Residential Demolitions")
+barplot(demo_points, names.arg = demo_labels)
+
+# num_demolitions - (num_commercial_demolitions + num_residential_demolitions)
+
+
+```
+
+## Examine Permit Statuses
+Examine the breakdown of permit statuses over the years and attempt to determine meaning/useful information from them. Notably - this shouldn't have any effect for non-nashville data sets, since the final permit status is only useful for determining whether or not a permit generated any waste at all, which will already be known information.
+
+
+``` {r Permit Statuses}
+
+selected_statuses <- table(unlist(austin_permits$status_current))
+selected_statuses
+
+barplot(prop.table(selected_statuses))
+
+```
+
+
+Here I took some of Adam's code to make a visualization of the permit type by year. However, in this case it is much less useful due to the overwhelming number of permit types. I did manage to reduce it slightly by only taking permit types that had more than 1000 permits of that type.
+``` {r By Year}
+austin_permits %>%
+  group_by(status_current) %>% 
+  filter(n()>1000) %>%
+  group_by(calendar_year_issued, status_current) %>%
+  summarise(counts = n()) %>% 
+  filter(calendar_year_issued>1980) %>%
+  ggplot(aes(x=calendar_year_issued, y=counts, fill=status_current)) +
+    geom_bar(stat='identity', position='dodge')
+
+
+```
+
+## Examine Work Classes
+Examine the breakdown of work classes overall.
+``` {r Work Classes}
+
+selected_work_classes <- table(unlist(austin_permits$work_class))
+selected_work_classes
+
+austin_permits %>%
+  ggplot(aes(x=work_class)) + 
+  geom_bar(aes(y=..prop.., group=1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+```
+
+
+
+
+Same as above, a breakdown of work classes by year this time. Unfortunately, the work classes are more evenly spread, so a useful visualization can only contain work classes present on more than 20,000 permits.
+
+``` {r work class by year}
+
+austin_permits %>%
+  filter(calendar_year_issued > 1980) %>%
+  group_by(calendar_year_issued, work_class) %>%
+  mutate(work_class_abbrev = ifelse(n()>10000, work_class, 'other')) %>%
+  ggplot(aes(x=calendar_year_issued, fill=work_class_abbrev)) +
+  geom_bar(width=0.5, position='dodge')
+
+
+
+```
+
+## Valuations
+This section explores combining valuations. I'm not really sure how legitimate to consider theese valuations, as a fairly substantial portion of them contain extremely large values. Will need to talk to the team at Nashville Metro to see what are the reasonable bounds on valuations.
+``` {r valuations}
+
+no_valuations <- austin_permits %>%
+  filter_at(low_density_columns_valuation, all_vars(is.na(.)))
+
+                 
+no_valuations
+
+austin_permits$total_valuation <- rowSums(austin_permits[,low_density_columns_valuation], na.rm = TRUE)
+
+
+sum(austin_permits$total_valuation == 0)
+
+combined_valuations = aggregate(austin_permits$total_valuation, by=list(Category=austin_permits$permit_num_clean), FUN=sum)
+
+max(combined_valuations$x)
+combined_valuations %>%
+  filter(x >1000000) %>%
+  nrow()
+  
+
+sum(combined_valuations == 0)/nrow(combined_valuations)
+
+```
+
+## Feather
+``` {r feather}
+write_feather(austin_permits, expand_boxpath("Austin, Tx/austin_permits.feather"))
+
+write_feather(res_demo_permits, expand_boxpath("Austin, Tx/austin_res_demo_permits.feather"))
+
+```
+
+
+
+## Austin Tonnages
+``` {r explore tonnages}
+tonnages <- read_feather(expand_boxpath("Austin, Tx/austin_tonnages.feather"))
+
+# First off, there are multiple forms of tonnage listed, so I want to check here to make sure there aren't any discrepancies between them.
+
+# From this, we can see that "Total Tons" and "Total Tons5" (as well as likely there respective Diversion and Landfill columns, even though those aren't relevant to our modeling) are identical, but "Commingled Total Tons" is slightly different. It's only different in 30 rows, and most of those rows are 0s in the commingled column, and actual values in the "Total Tons" column, so I'm going to treat "Total Tons" as the true source through the rest of this process
+
+identical(tonnages[['Total Tons']],tonnages[['Total Tons5']])
+identical(tonnages[['Commingled Total Tons']],tonnages[['Total Tons5']])
+identical(tonnages[['Commingled Total Tons']],tonnages[['Total Tons']])
+
+comparing <- tonnages %>%
+  select(`Commingled Total Tons`, `Total Tons`)  %>%
+  filter(`Commingled Total Tons` != `Total Tons`)
+
+comparing
+
+
+# Check repeat permit numbers and get histogram of number of repeats. It is clear that very few permit numbers are repeated, and even then, they are only repeated a single additional time. This is why my original analysis yielded a larger data set than expected.
+tonnages$permit_num_clean<- as.numeric(tonnages$permit_num_clean)
+tonnages_repeat_count = tonnages %>% select(permit_num_clean) %>%
+  group_by(permit_num_clean) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(-count)
+
+tonnages_repeat_count
+hist(tonnages_repeat_count$count)
+
+
+# Next we look at repeat tonnage numbers, as a rough gauge for the ACTUAL amount of repeated entries. This is not used to filter or change the data in any way, just to get a rough idea of how many repeats to expect. As we can see from the histogram, it is a significant amount of repeats of various numbers.
+repeat_count <- tonnages %>% select(`Total Tons`) %>%
+  filter(`Total Tons` > 0) %>%
+  group_by(`Total Tons`) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(-count)
+
+repeat_count
+hist(repeat_count$count)
+
+
+
+# Now we can pull out only the reference permits and see if that roughly aligns with what we are expecting
+filter_reference <- tonnages %>%
+  select(permit_num_clean, `Total Tons`, `Submitted Permit Type`) %>%
+  filter(`Submitted Permit Type` == "Reference")
+
+
+# Then, just for safety, we filter out repeated permit numbers and permits with 0 tonnage, so we know that we are maintaining unique ids
+filter_reference$permit_num_clean <- as.numeric(filter_reference$permit_num_clean)
+aggregate_filtered <- aggregate(filter_reference$`Total Tons`, by=list(Category=filter_reference$permit_num_clean), FUN=max)
+
+aggregate_renamed <- aggregate_filtered %>%
+          filter (x != 0) %>%
+          rename(permit_num_clean = Category,
+                 `Total Tons` = x)
+
+# Here we check the same numbers as before, except this time we look at the filtered set. As we can see here, there are now some, but very few, repeat tonnages. This is good, because we expect a small number of the tonnages to randomly be the same.
+repeat_count_filtered <- aggregate_renamed %>% select(`Total Tons`) %>%
+  filter(`Total Tons` > 0) %>%
+  group_by(`Total Tons`) %>%
+  mutate(count = n()) %>%
+  distinct() %>%
+  arrange(-count)
+
+hist(repeat_count_filtered$count)
+
+# Finally we check the length of the unique permit numbers, and it is the same as the total length of the dataset, showing that we no longer have any repeat permit numbers
+unique_check <- unique(aggregate_renamed$permit_num_clean)
+length(unique_check)
+nrow(aggregate_renamed)
+
+
+
+# Lets also take a look at the distribution of the remaining tonnages
+hist(aggregate_renamed$`Total Tons`)
+ 
+#Well, that wasn't super helpful. Let's zoom in on the section where the vast majority of values are. Even with all of the zeroes filtered out, the majority of the data is between 0-50 tons. Also of note, only 50 out of the 535 permits fall above this 500 ton threshold.
+large_values_removed <- aggregate_renamed %>%
+  filter(`Total Tons` < 500)
+
+nrow(aggregate_renamed) - nrow(large_values_removed)
+hist(large_values_removed$`Total Tons`)
+
+#Here is the original graph logged, just so that it is a bit more readable
+
+hist(log(aggregate_renamed$`Total Tons`))
+
+
+
+```
+
+
+

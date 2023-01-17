@@ -1,0 +1,85 @@
+---
+title: "12-load-nash"
+output: html_notebook
+---
+
+This script loads the Construction Permit Data for Nashville spanning the period of time of 6/15/2016 to 6/15/2021 from a single excel file located in Box. Functions are used to clean column names, check if values are within logical bounds, and evaluate NA values.
+
+```{r Load_setup, echo = FALSE, results='hide'}
+
+## Load libs, common functions
+
+ source(knitr::purl("10-load-data.Rmd"))
+ fs::file_delete("10-load-data.R")
+```
+
+
+
+```{r Load_Construction_Permits, echo = TRUE, results='show'}
+
+nash_permits <- read.csv(expand_boxpath("Nashville/Metro-Bldg-Permits-Last-5yrs.csv")) %>% 
+  clean_names() %>% 
+  rm_na_cols() %>%
+  rename("permit_number" = 1) %>%
+  drop_na(permit_number) %>%
+  assert(is.numeric, const_cost) %>%
+  assert(within_bounds(0, Inf), const_cost) %>%
+  #insist(within_n_sds(4), const_cost) %>% 
+  #note: found 5 exorbitantly expensive permits, confirming with Allie
+  assert(is.character, -const_cost)
+
+nash_permits[nash_permits=="NULL"]<-NA
+nash_permits[nash_permits==0]<-NA
+
+nash_permits = nash_permits %>% 
+  mutate(date_entered = as.Date(date_entered, format= "%m/%d/%Y")) %>%
+  mutate(date_issued = as.Date(date_issued, format= "%m/%d/%Y")) %>%
+  mutate(final_insp_date= as.Date(final_insp_date, format= "%m/%d/%Y"))
+
+
+nash_permits
+#NA check
+
+map(nash_permits, ~sum(is.na(.)))
+
+#zero NAs across all columns
+
+```
+
+## Issued Construction Permits
+The result of the above code, this dataframe contains permit information, but no data on debris. It seems to have roughly similar information to the Austin data set, except smaller in size and neater.
+
+```{r View_Data, results = 'show'}
+
+nash_permits
+
+#found 5 instances which are exorbitantly expensive:
+#11391, 27515, 45893, 57059, 59034
+
+#nash_permits[59034,]
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -5,12 +5,77 @@ output: html_notebook
 
 The purpose of this notebook is to load and clean the data.  It should also test the data (e.g., by assertr) to ensure that assumptions about the data are met, and store the cleaned and tested data.
 
-```{r}
-#Import helpful packages
-library(haven)
-library(vroom)
-library(boxr)
-library(janitor)
-library(assertr)
+# Load libs
+
+```{r setup}
+library(pacman)
+p_load(haven, vroom, boxr, janitor, assertr, tidyverse, readxl, fs, lubridate, feather)
 ```
 
+# Remove columns with all NA
+```{r remove na cols}
+rm_na_cols <- function(df){
+  #' Remove columns containing all NA
+  #'
+  #' Remove columns of a dataframe which contain all NAs. This function can be piped when loading data.
+  #'
+  #' @param df (dataframe/tibble) Original data
+  #'
+  #' @return (ataframe/tibble) Original data excluding columns containing all NAs
+  #' @export
+  #'
+  #' @examples
+  
+  return(df[, colSums(!is.na(df))>0])
+}
+```
+
+
+# Function for reading in files from box
+
+```{r retrieve boxpath}
+expand_boxpath <- function(rel_path){
+  #' Expand boxpath
+  #'
+  #' This takes in the relative path starting from the nash-zero folder and returns the full file path in a way that works across multiple user's systems.
+  #'
+  #' @param rel_path (chr) Relative path from nash-zero Box folder to desired file
+  #'
+  #' @return (chr) Full path to file
+  #' @export
+  #'
+  #' @examples
+  #' > expand_boxpath("Nashville/Total Building Permits Issued 2005-2020.xlsx")
+  #' [1] "/Users/[USERNAME]/Box/nash-zero/Nashville/Total Building Permits Issued 2005-2020.xlsx"
+  
+  boxpath <- paste(path.expand('~') %>% 
+                  str_replace("/Documents", ""),"/Box/nash-zero/",sep="")
+  
+  # I'm uncertain why, but the path to Box on my machine has changed. Here is a
+  # hack to adjust it if the above path does not work.
+  if(!dir.exists(boxpath)){
+    boxpath <- paste(path.expand('~') %>% 
+                  str_replace("/Documents", ""),"/Library/CloudStorage/Box-Box/nash-zero/",sep="")
+  }
+  return(paste(boxpath, rel_path, sep=""))
+}
+```
+
+# Text to date conversion
+```{r Convert text to dates}
+text_to_POSIXct <- function(data){
+  #' Text to POSIXct conversion
+  #'
+  #' Converts a misformatted date into a proper POSIXct date. Often in excel files, some dates appear as numeric entries like "41300". Often some dates in a column will take on this format, while others will take on a more traditional date format such as "2013-01-26". If the column is read in as text, all values will exist in this format and can be converted to POSIXct dates using this function.
+  #'
+  #' @param data (chr) Improperly formatted date(s). Roughly the number of days since 1900.
+  #'
+  #' @return (POSIXct) Correctly formatted POSIXct date(s)
+  #' @export
+  #'
+  #' @examples
+  #' > text_to_POSIXct("41300")
+  #' [1] "2013-01-26 CST"
+  as.POSIXct(format(as.Date(as.numeric(data), origin="1899-12-30")))
+}
+```
