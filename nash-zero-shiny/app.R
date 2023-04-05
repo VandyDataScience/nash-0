@@ -538,32 +538,32 @@ adjust_map_df <- function(df_nashmap, syn_permits_orig, debris_proj){
     mutate(total_debris_mean = total_debris_mean*new_over_old)
 }
 
+# Load forecast and permits
+forecast <- read_feather("shiny-data/best_forecast.feather")
+syn_permits_orig <- read_feather("shiny-data/syn_permit_summary.feather")
+df_nashmap_orig <- read_feather("shiny-data/map_summary.feather")
+
+# adjust syn_permits to get fractional values averaged over years
+syn_permits_summ <- adjust_permit_summ(syn_permits_orig)
+
+# Load projections for debris from historical fit (made in 44-2)
+debris_proj <- read_feather("shiny-data/debris_projections.feather")
+
+# Extract root-mean-square-percentage error from training
+rmspe <- debris_proj$rmspe[1]
+
+# adjust debris values in map for each subtype to scale to debris_proj
+df_nashmap <- adjust_map_df(df_nashmap_orig, syn_permits_orig, debris_proj)
+
+# prepare map
+setwd("shiny-data/shape")
+district <- readOGR(dsn = ".",
+                    layer = "nashville-tn-council-districts",
+                    verbose = FALSE)
+district_latlon <- spTransform(district, CRS("+proj=longlat +datum=WGS84"))
+
 #------------------------------------------------------------------------------#
 server <- function(input, output, session) {
-  
-  # Load forecast and permits
-  forecast <- read_feather("shiny-data/best_forecast.feather")
-  syn_permits_orig <- read_feather("shiny-data/syn_permit_summary.feather")
-  df_nashmap_orig <- read_feather("shiny-data/map_summary.feather")
-  
-  # adjust syn_permits to get fractional values averaged over years
-  syn_permits_summ <- adjust_permit_summ(syn_permits_orig)
-  
-  # Load projections for debris from historical fit (made in 44-2)
-  debris_proj <- read_feather("shiny-data/debris_projections.feather")
-  
-  # Extract root-mean-square-percentage error from training
-  rmspe <- debris_proj$rmspe[1]
-  
-  # adjust debris values in map for each subtype to scale to debris_proj
-  df_nashmap <- adjust_map_df(df_nashmap_orig, syn_permits_orig, debris_proj)
-  
-  # prepare map
-  setwd("shiny-data/shape")
-  district <- readOGR(dsn = ".",
-                      layer = "nashville-tn-council-districts",
-                      verbose = FALSE)
-  district_latlon <- spTransform(district, CRS("+proj=longlat +datum=WGS84"))
   
   #----------------------------------------------------------------------------#
   # Nashville map
